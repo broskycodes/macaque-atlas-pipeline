@@ -1,0 +1,234 @@
+1. Preprocessing
+    1.1. Preprocess scans
+        1.1.1. Bruker -> NIfTI conversion
+            1.1.1.1. Correct contrast using ITK-SNAP
+        1.1.2. Skull-stripping (SA)
+            1.1.2.1. Initial segmentation with 3D slicer (SA)
+                1.1.2.1.1. Correct orientation with 3D slicer
+            1.1.2.2. Refinement with ITK-SNAP (manual)
+            1.1.2.3. Cropping original scan with mask (can automate)
+    1.2. Set parameters
+        1.2.1. Propagation parameters
+        1.2.2. Fusion parameters
+2. Initial registration
+    2.1. Affine transformation (subject -> template) using ANTs registration
+        2.1.1. Confirm all files exist
+        2.1.2. Estimate transform per-subject
+            2.1.2.1. Initial alignment
+            2.1.2.2. Coarse-to-fine optimization (rigid + affine)
+                2.1.2.2.1. Similarity driven by MMI (Mattes Mutual Information)
+        2.1.3. Emit registration products on template grid
+            2.1.3.1. Forward and inverse transforms recorded
+        2.1.4. Score and gate
+            2.1.4.1. Normalized cross-correlation between warped subjects and template
+                2.1.4.1.1. Passes or warns per-subject based on threshold
+            2.1.4.2. Normalised mutual information from a foreground-masked joint histogram
+            2.1.4.3. Confirms warped shape = label shape
+        2.1.5. Save transforms, warped scans, elapsed time, cache status
+    2.2. Collapse to larger resolution in shared grid
+        2.2.1. Determine target voxel size
+            2.2.1.1. Maintain in-plane resolution, restore subjects’ through-plan resolution (0.15mmx0.15mmx0.75mm)
+        2.2.2. Build reference grid
+            2.2.2.1. Resample template to reference grid
+            2.2.2.2. New voxel count = old count x old spacing / new spacing, rounded
+        2.2.3. Resample template labels
+            2.2.3.1. Written onto reference grid with identity transform
+        2.2.4. Resample each subject
+            2.2.4.1. From original images, forward transform is applied onto the reference grid, collapsing into a single interpolation
+        2.2.5. Record and verify the new grid and registration outputs
+3. Parcellation and Initial Export
+    3.1. Parcellation
+        3.1.1. Apply hemisphere mask (zeroes out right hemisphere)
+        3.1.2. Trace boundaries into a graph
+            3.1.2.1. Drop voxels below certain threshold (delete tiny regions)
+            3.1.2.2. Walk slice and record when voxels change regions
+                3.1.2.2.1. Each segment records the two regions it separates
+            3.1.2.3. Merge segments with same region boundaries into polylines
+        3.1.3. Smoothing and simplification
+            3.1.3.1. Gaussian low-pass filter
+            3.1.3.2. Simplification via Douglas-Pecker algorithm
+            3.1.3.3. Separate closed rings and open arcs
+        3.1.4. Compute seeds
+        3.1.5. Template graph identically applied to every slice
+            3.1.5.1. Written as ASCII line file
+    3.2. Export slices for correction
+        3.2.1. Loads “warped” T1 as underlay
+        3.2.2. Re-masks label slice to chosen hemisphere
+        3.2.3. Write layered SVG
+            3.2.3.1. Background (white + T1 raster)
+            3.2.3.2. Boundaries (line vectors, emitted as junction-wise arcs)
+            3.2.3.3. Labels (annotations
+        3.2.4. Write region reference table
+        3.2.5. Output SVG
+4. Expert correction and alignment (manual)
+    4.1. (if necessary) Re-register the parcellation to each slice
+    4.2. Adjust the lines to fit the regions of each scan (through Illustrator or another tool)
+        4.2.1. Add/delete regions as needed (adhering to certain rules)
+        4.2.2. Template graphs must remain topologically identical
+    4.3. Import corrected lines
+5. Contour Fusion
+    5.1. Setup
+        5.1.1. Load fusion parameters
+        5.1.2. Load per-subject boundary graphs
+        5.1.3. Build seeds and expected region IDs
+            5.1.3.1. Masked to chosen hemisphere
+            5.1.3.2. Compute per-region seeds
+            5.1.3.3. Compile list of non-zero region IDs present per-slice
+    5.2. Constructing per-subject line network
+        5.2.1. Normalize weights
+        5.2.2. Decompose per-slice graph into arcs + nodes (first pass)
+            5.2.2.1. Find arc endpoints within tolerance -> node junctions
+            5.2.2.2. Record closed island loops (no nodes)
+        5.2.3. Inject phantom regions
+            5.2.3.1. Template built for every symmetrically different region R
+                5.2.3.1.1. Bounding arcs
+                5.2.3.1.2. Neighbor codes
+                5.2.3.1.3. Boundary junctions
+                5.2.3.1.4. Junction structure (topology)
+            5.2.3.2. Reduce region R for addition to other subject(s)
+                5.2.3.2.1. Periphery -> reduces to line
+                    5.2.3.2.1.1. Project R onto other subject(s)
+                    5.2.3.2.1.2. Cut shared arcs where they intersect with R, place new nodes (leave internal arcs alone)
+                    5.2.3.2.1.3. Collapse R’s boundary to that of the shared boundary between new nodes
+                5.2.3.2.2. Enclosed (<= 1 neighbor) -> reduces to point
+                    5.2.3.2.2.1. Collapse R’s boundary to centroid/seed point
+                5.2.3.2.3. Enclosed (>= 2 neighbor, meets at one point w/o R, every R-junction is a triple point) -> reduced to clustered, superimposed points
+                    5.2.3.2.3.1. Specially mark each arc (wall) of R
+                    5.2.3.2.3.2. Collapse R’s boundary to a cluster of triple points, each connected to two of the shared regions, and connected to each other by zero-length arcs.
+                5.2.3.2.4. Other (complex) cases -> Halts contour fusion for that slice (failure mode)
+                    5.2.3.2.4.1. Records location of failure
+            5.2.3.3. Output records of added phantom regions and complex cases
+        5.2.4. Decompose updated per-slice graph into arcs + nodes (second pass)
+            5.2.4.1. Find arc endpoints within tolerance -> node junctions
+            5.2.4.2. Record closed island loops (no nodes)
+            5.2.4.3. Phantom regions loudly declared
+    5.3. Node fusion
+        5.3.1. Match node junctions across subjects
+            5.3.1.1. Match through incident region sets
+            5.3.1.2. Collisions resolved by Hungarian assessment within a set displacement
+                5.3.1.2.1. Phantom node junctions exempt from displacement requirement
+            5.3.1.3. Averaging step
+        5.3.2. End node fusion per-slice if any of the following occurs
+            5.3.2.1. Any complex (non-autoresolvable) cases are present
+            5.3.2.2. Node match rate is below a certain threshold
+            5.3.2.3. There are any other conflicting/unmatched node junctions
+    5.4. Per-arc fusion (Edge fusion)
+        5.4.1. Order subjects and incorporate weights
+            5.4.1.1. Define reference subject (manual toggle, subject with most nodes, then least phantom regions, then first subject)
+            5.4.1.2. Starting with reference subject, pull other subjects’ arcs and weights into shared space
+                5.4.1.2.1. Renormalize weights per-arc
+        5.4.2. Orient arcs per-subject to establish point-wise correspondence
+            5.4.2.1. For island regions -> resample all copies to a common point count, force consistent winding (using signed area), and rotate (using FFT correlation) until start points line up
+            5.4.2.2. For arcs -> force all arcs to run in the same direction as the reference
+                5.4.2.2.1. Evaluate difference between forward and reverse orientations of each arc
+        5.4.3. Determine curvature per-point for every arc polyline
+            5.4.3.1. Every arc polyline gets an ArcRep wrapper
+                5.4.3.1.1. Stores working dense copy of arc internally
+        5.4.4. Create anchor table per-arc (keypoints = True)
+            5.4.4.1. Determine keypoints
+                5.4.4.1.1. Walk each arc’s curvature to find local maxima of |curvature| above a certain floor within a certain interval
+            5.4.4.2. Match keypoints
+                5.4.4.2.1. Use a benefit matrix (two points must be close and at a similar point in the arc) to propose assignments
+                5.4.4.2.2. Solve matching with Hungarian algorithm
+            5.4.4.3. Add keypoints to anchor table
+                5.4.4.3.1. Keypoints with 2+ matches get added
+                5.4.4.3.2. Subjects missing an anchor get a replacement via linear interpolation between existing anchors
+        5.4.5. Create anchor table per-arc (keypoints = False)
+            5.4.5.1. Anchor table only returns [0, 1] (endpoints)
+        5.4.6. Piecewise fusion between consecutive anchors
+            5.4.6.1. Determine # of sample points between anchor intervals
+                5.4.6.1.1. Take sagitta bound, resampling and growing until within tolerance or above max samples permitted
+                    5.4.6.1.1.1. Label “saturated” if the bound is outside tolerance even with max samples.
+                5.4.6.1.2. Output max chords required among subjects
+            5.4.6.2. Resample each subject’s segment with # of sample points
+                5.4.6.2.1. Place points by arc length (lambda = 0)
+                5.4.6.2.2. Place points by curvature (lambda = 1)
+                5.4.6.2.3. Place points by a blend of both methods (0 < lambda < 1)
+            5.4.6.3. Take weighted pointwise mean of all sample points
+        5.4.7. Concatenate fused per-sample segments into arc polylines
+            5.4.7.1. Drop duplicate anchors to avoid double counting
+        5.4.8. Snap arc endpoints to fused nodes
+            5.4.8.1. Distribute required correction linearly along the arc
+            5.4.8.2. Identical points are merged
+    5.5. Polygon construction
+        5.5.1. Prepare arcs
+            5.5.1.1. Drop degenerate arcs
+            5.5.1.2. Remove duplicate geometry
+            5.5.1.3. (optional) Snap dangling ends to nodes within tolerance
+        5.5.2. Polygonize arcs
+            5.5.2.1. Count interior arc crossings
+            5.5.2.2. Split arcs at crossings
+            5.5.2.3. Produce faces using polygonize
+                5.5.2.3.1. If error arises, try un-noded, then rebuild one ring per region (won’t represent holes, not ideal)
+        5.5.3. Assign faces to regions
+            5.5.3.1. A face bounded by arcs takes the common region ID
+            5.5.3.2. Neighbor rule is used to resolve island / donut pairs
+            5.5.3.3. Use distance-transform seed to decide ambiguities
+            5.5.3.4. Everything else is given an UNLABELED designation and RID
+        5.5.4. Update per-slice registry
+        5.5.5. Rebuild per-subject atlases (for diagnostics if enabled)
+        5.5.6. Output polygons as atlas
+6. Conversion to volumetric model
+    6.1. Mirror Hemisphere back for Bilateral Symmetry
+        6.1.1. Reflect kept-hemisphere graph across the L-R midline
+        6.1.2. Weld the reflection to the original at the midline
+            6.1.2.1. Merge coincident nodes along the midline seam
+            6.1.2.2. Drop duplicated midline arcs so that faces can merge across the center
+        6.1.3. Rebuild full-brain faces from the welded graph
+        6.1.4. Ensure same region IDs on both hemispheres
+    6.2. Rasterize polygonized atlas into a labeled volume
+        6.2.1. Load template label volume for grid dimensions and affine
+        6.2.2. Allocate an empty int16 volume, set background ID to zero
+        6.2.3. Per-Slice Work
+            6.2.3.1. Merges every multi-polygon into single list of polygons
+            6.2.3.2. Sort each polygon face by area in descending order
+            6.2.3.3. Fill each face's exterior ring with its region ID (using even-odd rule)
+            6.2.3.4. Sets interior/enclosing regions to zero
+            6.2.3.5. Nested regions painted later overwrite the enclosing region
+            6.2.3.6. Write each slice into the label volume
+                6.2.3.6.1. No reorientation required
+                6.2.3.6.2. Coordinate Swap
+        6.2.4. Skip slices with no faces
+        6.2.5. Verify orientation on a representative slice (overlay vs template, IoU)
+        6.2.6. Unresolved faces carry unlabeled IDs into the volume as a stray material
+    6.3. Write the Label Volume in M3C’s input format (SPR/SDT)
+        6.3.1. Assert that the in-plane grid as a square
+        6.3.2. Build the header
+            6.3.2.1. Dim - the grid size
+            6.3.2.2. Interval - voxel size
+            6.3.2.3. FOV/field of view
+        6.3.3. Binary (.sdt)
+        6.3.4. Copy to local disk instead of reading across Google Drive before handing to M3C
+    6.4. Multiple-Material Marching Cubes
+        6.4.1. Build for host-platform (python compatible)
+        6.4.2. Read SPR/SDT
+        6.4.3. Set M3C Parameters
+            6.4.3.1. Slice Range (all slices or a sub-range)
+            6.4.3.2. Cap (close each surface with a flat lid at the boundary of each slice range)
+            6.4.3.3. Linearize
+            6.4.3.4. Centering around the origin
+            6.4.3.5. X-Y-Z spacing
+        6.4.4. March a 2x2x2 voxel cube through the volume
+            6.4.4.1. Classify the 8 corners by Region ID
+            6.4.4.2. Emit triangles from case table
+            6.4.4.3. Walls shared between 2 regions are generated once to prevent gaps/overlaps
+        6.4.5. Place vertices at the midpoints of edges
+            6.4.5.1. No interpolation possible between region IDs
+            6.4.5.2. Produces a staircase lattice
+        6.4.6. Output Generation
+            6.4.6.1. One PolyData surface (.vtk) per material
+            6.4.6.2. Combined node/element files
+    6.5. Surface Conditioning
+        6.5.1. Read VTK Files
+        6.5.2. Taubin Smoothing (preserves volume, unlike traditional Laplacian Smoothing)
+    6.6. Output Deliverables
+        6.6.1. NIfTI Label-Map on the template affine
+        6.6.2. Region Look-up Table (CSV)
+        6.6.3. ITK-SNAP Label Description File
+        6.6.4. FreeSurfer Look-up Table (for 3D Slicer)
+        6.6.5. Surface
+            6.6.5.1. Per-region STL and OBJ
+            6.6.5.2. Per-region VTK PolyData for 3D Slicer
+        6.6.6. Merge all regions into one interactive mesh
+            6.6.6.1. Set visual parameters (lighting, occlusion, etc.)
+        6.6.7. Standalone HTML Viewer (Plotly)
