@@ -23,6 +23,7 @@ exactly ONCE, islands are first-class closed arcs, and both codes ride on every 
 import numpy as np
 
 
+# 5.6.6.2.1  resample a closed contour to n points, evenly spaced by arc length
 def resample_closed_contour(points, n=200):
     """Resample a closed contour to n points, evenly spaced by arc length."""
     pts = np.asarray(points, float)
@@ -43,6 +44,7 @@ def resample_closed_contour(points, n=200):
     return out
 
 
+# 5.6.2.1  force consistent winding, then roll the start point onto the reference
 def _align_direction_and_start(ref, cand):
     """Reverse cand if it runs opposite to ref, then roll it to the best start offset."""
     # direction: compare signed area (orientation) of the two contours
@@ -62,6 +64,7 @@ def _align_direction_and_start(ref, cand):
     return np.roll(cand, -best_k, axis=0)
 
 
+# 5.6.6.3  pointwise mean of one region's contour across subjects
 def average_region_contours(subject_contours, n=200):
     """Average a list of closed contours (one per subject) for ONE region.
     Returns the mean contour (n,2)."""
@@ -73,6 +76,7 @@ def average_region_contours(subject_contours, n=200):
     return np.mean(np.stack(aligned, axis=0), axis=0)
 
 
+# 5.6  average every region on one slice (whole-contour path; edge_fusion is the per-arc path)
 def fuse_slice_contours(subject_region_contours, n=200):
     """Average all regions on one slice across subjects.
     `subject_region_contours` = {region_id: [contour_subj1, contour_subj2, ...]}.
@@ -85,6 +89,7 @@ def fuse_slice_contours(subject_region_contours, n=200):
     return fused
 
 
+# 5.7 / 3.1.6  mean contours into a BoundaryGraph plus one centroid seed per region
 def fused_contours_to_graph(fused_contours, merge_tol=None):
     """Turn {region_id: mean_contour} into a BoundaryGraph + seed list for region ID.
     Each contour becomes a closed polyline; the region centroid becomes its seed."""

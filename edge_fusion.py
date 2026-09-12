@@ -296,6 +296,7 @@ def fragment_index(code):
     code = int(code)
     return code % FRAGMENT_MULT if code >= FRAGMENT_MULT else 0
 
+# 3.1.2.1  split a base id into per-component fragment codes (ab#k)
 def fragment_relabel_slice(label_slice, min_voxels=1):
     """Relabel a raster so each connected piece of each region has a unique code. [3.1.2]
     Largest piece keeps the base id; others get base*FRAGMENT_MULT + j ordered by size. Run
@@ -321,6 +322,7 @@ def fragment_relabel_slice(label_slice, min_voxels=1):
                 lab[comps == ci] = rid * FRAGMENT_MULT + j
     return lab
 
+# 5.1.3.2  the template's canonical fragment table
 def fragment_canon_table(label_slice_relabelled):
     """{base: [(canonical fragment code, centroid (x, y)), ...]} from the ALREADY relabelled
     template slice. [5.1.3.2]"""
@@ -343,6 +345,7 @@ def _graph_code_centroids(g):
                 a[0] += x; a[1] += y; a[2] += 1
     return {c: (v[0] / v[2], v[1] / v[2]) for c, v in acc.items() if v[2]}
 
+# 5.1.3.2  match each subject's fragments onto the template's by centroid distance
 def canonicalize_fragments(graphs, canon_table, params):
     """Remap each subject graph's fragment codes onto the canonical codes, per base region, by
     nearest-centroid assignment (near-copy assumption). [5.1.3.2]"""
@@ -385,6 +388,7 @@ def canonicalize_fragments(graphs, canon_table, params):
             notes.extend((sid, a, b) for a, b in sorted(remap.items()))
     return notes
 
+# 6.1.5  fragments merged back to their base region ids
 def merge_fragment_regions(regions):
     """{fragment code: faces} -> {base id: faces}: the FINISHED-atlas view (one region). [6.1.5]"""
     out = defaultdict(list)
@@ -392,6 +396,7 @@ def merge_fragment_regions(regions):
         out[fragment_base(rid)].extend(faces)
     return dict(out)
 
+# 5.6.4.4  one anchor per base region, on its largest fragment
 def filter_anchors_largest_fragment(anchors):
     """Keep ONE label anchor per BASE region: the base-coded fragment (relabelling makes that the
     largest), else the greatest-clearance anchor. [5.6.4.4]"""
@@ -403,6 +408,7 @@ def filter_anchors_largest_fragment(anchors):
             best[b] = (key, a)
     return [best[b][1] for b in sorted(best)]
 
+# 5.7.4.1  base-rollup: a base region is gone only when every fragment is inactive
 def registry_base_status(reg, slice_index):
     """Roll per-fragment registry records up to base regions. [5.7.4.1]
     A base is inactive only when EVERY fragment of it is inactive on the slice; purge and delete
@@ -444,6 +450,7 @@ def densify(P, spacing, closed=False):
     t = np.linspace(0.0, s[-1], n)
     return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
 
+# 5.6.3  curvature per point along an arc polyline
 def curvature(P, sigma_px=1.0, spacing=None, closed=False):
     """Discrete SIGNED curvature AT A SCALE; P must be arc-length parameterised. [5.6.3]
     x(s) and y(s) are Gaussian-smoothed at sigma_px before differentiating, without which a
@@ -465,6 +472,7 @@ def curvature(P, sigma_px=1.0, spacing=None, closed=False):
     den = (d1[:, 0] ** 2 + d1[:, 1] ** 2) ** 1.5 + 1e-12
     return num / den
 
+# 5.6.6.1.1  sagitta (max chord deviation) between a polyline and its resampling
 def max_deviation(P, R):
     """Max distance from the vertices of P to the polyline R. [5.6.6.1.1]"""
     P = np.asarray(P, float); R = np.asarray(R, float)
@@ -479,6 +487,7 @@ def max_deviation(P, R):
     d = np.linalg.norm(P[:, None, :] - proj, axis=2)
     return float(d.min(axis=1).max())
 
+# 5.6.6.1  grow the sample count until the sagitta bound is met (5.6.6.1.3 returns the max across subjects)
 def segment_budget(sub_arcs, tol_px, n_min, n_max, sigma_px, spacing, lam=0.5):
     """F1a sagitta bound: chords needed to stay within tol_px of the true arc. [5.6.6.1.1]
     m = ceil(L / sqrt(8 * tol * r)), clamped to [n_min_seg, n_max_seg]; hitting the clamp is
@@ -503,6 +512,7 @@ def segment_budget(sub_arcs, tol_px, n_min, n_max, sigma_px, spacing, lam=0.5):
         n = max(n, m)
     return int(np.clip(n, n_min, n_max))
 
+# 5.6.6.2  place points by arc length (lam=0), curvature (lam=1) or a blend
 def resample_by_curvature(P, n, lam=0.5, sigma_px=1.0, spacing=None, closed=False, abs_k=None):
     """F1a reparameterisation, sampling s' uniformly. [5.6.6.2]
     s' = (1-lam)*arclength + lam*cumulative|curvature|."""
@@ -564,6 +574,7 @@ def signed_area(P):
 # =====================================================================================
 # 2.  Arc representation: polyline (F1a) or spline (F1b), behind one interface   [5.6.3.1]
 # =====================================================================================
+# 5.6.3.1 / 5.6.3.2  ArcRep wrapper holding the dense working copy of one arc
 class ArcRep:
     """A curve that can be EVALUATED at any fractional position u in [0,1], and whose curvature can
     be asked for at those positions. [5.6.3.1]"""
@@ -626,6 +637,7 @@ class ArcRep:
 # =====================================================================================
 # 3.  Key points (SATM Step 1) and their matching (SATM Step 2)                   [F1]   [5.6.4]
 # =====================================================================================
+# 5.6.4.1 / 5.6.4.1.1  local maxima of |curvature| above the floor, within a spacing
 def edge_keypoints(rep: ArcRep, params: FusionParams):
     """Local |curvature| maxima, at least kp_alpha apart, above kp_curv_thresh. [5.6.4.1]
     Returns fractional positions u in (0,1), sorted."""
@@ -651,6 +663,7 @@ def edge_keypoints(rep: ArcRep, params: FusionParams):
             keep.append(i)
     return sorted(float(u[i]) for i in keep)
 
+# 5.6.4.2  benefit matrix (5.6.4.2.1) solved by the Hungarian algorithm (5.6.4.2.2)
 def match_keypoints(repA, uA, repB, uB, params: FusionParams, l_scale=None):
     """SATM Step 2, applied per arc. [5.6.4.2]
     Returns [(uA_k, uB_r), ...], sorted, strictly monotone in BOTH arcs."""
@@ -682,6 +695,7 @@ def match_keypoints(repA, uA, repB, uB, params: FusionParams, l_scale=None):
         out.append((ua, ub))
     return out, crossed
 
+# 5.6.4.3 / 5.6.5  anchors with 2+ matches are kept; a missing subject is interpolated (5.6.4.3.2)
 def anchor_table(reps, ref, params: FusionParams):
     """N-subject generalisation of SATM's pairwise key-point matching. [5.6.4.3]
     Returns ({sid: [0.0, ..., 1.0]}, n_anchors, n_dropped), same length for every subject; an
@@ -727,6 +741,7 @@ def _code_of(e):
     a, b = int(e[2]), int(e[3])
     return (min(a, b), max(a, b))
 
+# 5.2.2 / 5.4  decompose a per-slice graph into arcs and node junctions
 def graph_to_arcs(g, sid=None):
     """Split a BoundaryGraph into ARCS: maximal chains of same-code elements between JUNCTION
     nodes. [5.2.2]"""
@@ -779,6 +794,7 @@ def graph_to_arcs(g, sid=None):
 
     return [a for a in arcs if len(_dedup(a.pts)) >= 2]
 
+# 5.6.8.2  rebuild a graph from arcs, welding identical points
 def arcs_to_graph(arcs, weld=1e-9):
     """Arcs -> BoundaryGraph. [5.6.7]"""
     import boundary_graph as bg
@@ -804,6 +820,7 @@ def arcs_to_graph(arcs, weld=1e-9):
     g.nodes = np.asarray(xy, float) if xy else np.zeros((0, 2))
     return g
 
+# 5.2.2.1 / 5.4.1  arc endpoints within tolerance become node junctions
 def arcs_to_node_graph(arcs, weld=1e-9, verify=True):
     """Fused ARCS -> a COMPLETE node/element PSLG: EVERY polyline vertex becomes a node, every
     segment becomes one element carrying both region codes. [5.2.2]"""
@@ -851,6 +868,7 @@ def arcs_to_node_graph(arcs, weld=1e-9, verify=True):
 # 5.  Nodes: cluster within a subject, then match across subjects            [F2, F3]
 #    [5.2.2.1, 5.5.1]
 # =====================================================================================
+# 5.2.2.1  cluster arc endpoints within a subject into node junctions
 def build_nodes(arcs, params: FusionParams):
     """Cluster the endpoints of all OPEN arcs into junction nodes (single-link at node_tol).
     [5.2.2.1]"""
@@ -915,6 +933,7 @@ def build_nodes(arcs, params: FusionParams):
         node_phantom.append(all_phantom or has_label)
     return np.asarray(node_xy, float), node_regions, node_phantom
 
+# 5.5.1  match node junctions across subjects
 def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
     """Nodes are grouped by their incident REGION SET -- a topological key that is GIVEN by the
     labels, where SATM has to infer correspondence from geometry. [5.5.1]"""
@@ -922,6 +941,7 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
     per, keys = {}, set()
     for sid, (xy, regs) in subj_nodes.items():
         d = defaultdict(list)
+        # 5.5.1.1  key each junction by its incident region set
         for i, k in enumerate(regs):
             d[k].append(i)
         per[sid] = d
@@ -966,14 +986,17 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
                 continue
             A = np.array([_slot_pos(s, subj_nodes, weights) for s in slots])
             C = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)
+            # 5.5.1.2  collisions resolved by Hungarian assignment
             r, c = linear_sum_assignment(C)
             taken = set()
             for ri, ci in zip(r, c):
                 # phantom nodes are DEFINED to sit at a collapsed locus, so they are legitimately
                 # far from the real boundary they align to -> exempt them from the displacement gate.
+                # 5.5.1.3  phantom junctions are exempt from the displacement gate
                 _cand_phantom = bool(subj_phantom and subj_phantom.get(sid, [False]*99999)[idx[ci]])
                 _slot_phantom = any(bool(subj_phantom and subj_phantom.get(s2, [False]*99999)[i2])
                                     for s2, i2 in slots[ri].items()) if subj_phantom else False
+                # 5.5.1.2  displacement gate (node_match_max)
                 if C[ri, ci] > params.node_match_max and not (_cand_phantom or _slot_phantom):  # [F2]
                     _rec = (sid, tuple(sorted(key)), round(float(C[ri, ci]), 2))
                     if _is_isolating(key):
@@ -990,6 +1013,7 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
 
         for slot in slots:
             fi = len(fused_xy)
+            # 5.5.2  averaging step
             fused_xy.append(_slot_pos(slot, subj_nodes, weights))
             for sid, i in slot.items():
                 node_map[sid][i] = fi
@@ -998,6 +1022,7 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
 
 def _slot_pos(slot, subj_nodes, weights):
     w = np.array([weights[sid] for sid in slot], float)
+    # 5.5.2  weights normalised over the subjects present at this junction
     w = w / w.sum()
     P = np.array([subj_nodes[sid][0][i] for sid, i in slot.items()], float)
     return (w[:, None] * P).sum(axis=0)
@@ -1064,16 +1089,20 @@ def _in_window(xy, bbox, margin):
     return (lo[0] - margin <= xy[0] <= hi[0] + margin and
             lo[1] - margin <= xy[1] <= hi[1] + margin)
 
+# 5.3.2  build the template for fragment R from a subject that has it
 def _fragment_template(all_arcs, node_xy, node_regs, R, params):
     """From a subject that HAS fragment R: ordered boundary cycle, cyclic neighbours,
     junction positions, spoke codes, far-end keys. Returns (template, None) or (None, why)."""
     R = int(R)
+    # 5.3.2.1  bounding arcs
     Rarcs = [a for a in all_arcs if R in (int(a.code[0]), int(a.code[1]))]
     if not Rarcs:
         return None, f"fragment {R} has no arcs"
+    # 5.3.2.5  window around the template fragment; every lookup below is restricted to it
     rep, bbox = _arcs_rep_bbox(Rarcs)
     neigh = set()
     for a in Rarcs:
+        # 5.3.2.2  neighbour codes (background counts as a neighbour)
         neigh.update(int(c) for c in a.code if int(c) != R)
     open_c = [a for a in Rarcs if not a.closed]
     if not open_c:                                             # island fragment
@@ -1086,6 +1115,7 @@ def _fragment_template(all_arcs, node_xy, node_regs, R, params):
         byn[a.n0].append(a); byn[a.n1].append(a)
     if any(len(v) != 2 for v in byn.values()) or len(byn) != len(open_c):
         return None, f"fragment {R} boundary is not a single cycle (relabelling gap?)"
+    # 5.3.2.3  ordered boundary cycle: arcs chained end to end around R
     cyc, vlist = [open_c[0]], []
     cur, node, start = open_c[0], open_c[0].n1, open_c[0].n0
     while True:                                                # walk the closed chain
@@ -1118,11 +1148,13 @@ def _fragment_template(all_arcs, node_xy, node_regs, R, params):
         if tuple(sorted(int(c) for c in sp.code)) != pair:
             return None, f"arc at junction of fragment {R} is not the expected wall {pair}"
         far = sp.n1 if sp.n0 == v else sp.n0
+        # 5.3.2.4  spoke per junction: the wall arc N_i|N_i+1 at v_i
         spoke.append(pair)
         far_key.append(frozenset(int(x) for x in node_regs[far]))
     base["spoke"] = spoke; base["far_key"] = far_key
     return base, None
 
+# 5.3.3  classify the reduction: point, line, tree or complex
 def _classify_fragment(tmpl, params):
     outer = int(params.outer_code)
     if tmpl["kind"] == "island":
@@ -1131,6 +1163,7 @@ def _classify_fragment(tmpl, params):
         return "complex: island fragment with 2+ neighbours"
     return "line" if len(tmpl["neigh"]) == 2 else "tree"
 
+# 5.3.3.1  island -> point: a tiny copy at the seed, phantom_eps_px long (5.3.3.1.2)
 def _inject_point_phantom(R, s, tmpl, seed, subj_arcs, params):
     c = np.asarray(tmpl["rep"] if seed is None else seed, float)
     eps = float(params.phantom_eps_px)
@@ -1143,6 +1176,7 @@ def _inject_point_phantom(R, s, tmpl, seed, subj_arcs, params):
                                 closed=bool(a.closed), phantom=True))
     return tuple(float(x) for x in c), None
 
+# 5.3.3.2  lens -> line: cut the host border and collapse R's boundary onto it
 def _inject_line_phantom(R, s, tmpl, subj_arcs, params):
     pair = tuple(sorted(int(x) for x in tmpl["neigh"]))
     m = float(params.phantom_window_margin_px)
@@ -1168,6 +1202,7 @@ def _inject_line_phantom(R, s, tmpl, subj_arcs, params):
                                     closed=False, phantom=True))
     return tuple(float(x) for x in seg.mean(axis=0)), None
 
+# 5.3.3.3  3+ neighbours -> tree
 def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
     """Pin R's junctions in subject s [Thm 1] and route its boundary along the tree of new arcs
     [Thm 2].
@@ -1176,6 +1211,7 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
     neigh = set(int(x) for x in tmpl["neigh"])
     Sarcs = [a for a in subj_arcs[s] if not a.closed]
     t_nodes, spoke_ends, taken = [], [], set()
+    # 5.3.3.3.1  pin each boundary junction via its spoke's near end
     for i in range(k):                                   # -- 1. pinning [Thm 1; B2 tiebreak]
         pair, vxy, fk = tmpl["spoke"][i], tmpl["v_xy"][i], tmpl["far_key"][i]
         cands = [a for a in Sarcs
@@ -1201,6 +1237,7 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
         taken.add((id(a), end))
         spoke_ends.append((a, end))
         t_nodes.append(t)
+    # 5.3.3.3.2  collect the NEW arcs: walls between non-consecutive neighbours (diagonals)
     spoke_ids = {id(x[0]) for x in spoke_ends}           # -- 2. the NEW arcs [Thm 2a-b]
     NEW = []
     for a in Sarcs:
@@ -1218,12 +1255,14 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
     J = set(t_nodes)
     for a in NEW:
         J.add(a.n0); J.add(a.n1)
+    # 5.3.3.3.2  the NEW arcs must form a tree (junctions = diagonals + 1)
     if len(J) != len(NEW) + 1:                           # -- 3. tree + obstruction checks
         return None, (f"new arcs around fragment {R} are not a tree "
                       f"({len(NEW)} arcs, {len(J)} junctions)")
     adj = defaultdict(list)
     for a in NEW:
         adj[a.n0].append((a.n1, a)); adj[a.n1].append((a.n0, a))
+    # 5.3.3.3.2  and must be connected to a pin
     seen, stack = {next(iter(J))}, [next(iter(J))]
     while stack:
         u = stack.pop()
@@ -1233,12 +1272,14 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
     if seen != J:
         return None, f"new arcs around fragment {R} are disconnected from a pin"
     new_ids = {id(a) for a in NEW}
+    # 5.3.3.3.4  no arc outside the tree may end at a pinned junction
     for a in Sarcs:                                      # foreign arc at a pinned junction:
         if id(a) in new_ids or id(a) in spoke_ids:       # catches T1 flips (C1) and adjacent
             continue                                     # missing clusters (B3) in one net
         if a.n0 in J or a.n1 in J:
             return None, (f"foreign arc {tuple(sorted(int(c) for c in a.code))} ends at "
                           f"a pinned junction of fragment {R}")
+    # 5.3.3.3.3  route each boundary arc as the unique tree path t_i-1 -> t_i
     paths, use = [], defaultdict(int)                    # -- 4. paths [Thm 2d] + cover [2e]
     for i in range(k):
         a0, b0 = t_nodes[i - 1], t_nodes[i]
@@ -1260,20 +1301,24 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
         for _pu, _u, arc in seq:
             use[id(arc)] += 1
         paths.append(seq)
+    # 5.3.3.3.4  double cover: every diagonal is traced by exactly two boundary paths
     if any(use[id(a)] != 2 for a in NEW):
         return None, f"double-cover check failed around fragment {R}"
     return (t_nodes, paths, NEW, spoke_ends), None
 
+# 5.3.3.3.5 - 5.3.3.3.7  insert the phantom boundary, mark the spoke ends, absorb the diagonals
 def _inject_tree_phantom(R, s, tmpl, t_nodes, paths, NEW, spoke_ends,
                          subj_arcs, node_xy, params):
     """Insert R's zero-area boundary along the tree, relabel spoke near-ends, absorb
     the diagonals. Returns (xy, number of diagonals)."""
     k = tmpl["k"]
+    # 5.3.3.3.5  distinct marks so superimposed junctions stay separate until after node fusion
     lab = [f"phT{int(R)}_{s}_{i}" for i in range(k)]
     for i, (a, end) in enumerate(spoke_ends):            # generalised wall relabelling
         pl = list(a.plabels) if getattr(a, "plabels", None) else [None, None]
         pl[end] = lab[i]
         a.plabels = tuple(pl)
+    # 5.3.3.3.6  add the phantom boundary arcs (zero-length or arc-length copies of the tree paths)
     for i in range(k):                                   # boundary arc i: v[i-1] -> v[i]
         if not paths[i]:
             p = np.asarray(node_xy[t_nodes[i]], float)
@@ -1289,10 +1334,12 @@ def _inject_tree_phantom(R, s, tmpl, t_nodes, paths, NEW, spoke_ends,
                  closed=False, phantom=True)
         ph.plabels = (lab[i - 1], lab[i])
         subj_arcs[s].append(ph)
+    # 5.3.3.3.7  absorb the diagonals: their geometry now lives inside the phantom arcs
     new_ids = {id(a) for a in NEW}                       # ABSORPTION [decision A4]
     subj_arcs[s][:] = [a for a in subj_arcs[s] if id(a) not in new_ids]
     return tuple(float(x) for x in node_xy[t_nodes[0]]), len(NEW)
 
+# 5.3  inject phantom regions (5.3.1 neighbour-set agreement, 5.3.4 records)
 def inject_phantom_regions(subj_arcs, subj_xy, subj_regs, seeds, params):
     """Fragment-code-scoped phantom injection (Situation 2); mutates subj_arcs in place. [5.3]
     Records: inserted [(rid, sid, kind, xy)] with kind in {point, line, tree/<n>diag}; complex_
@@ -1384,6 +1431,7 @@ def _ctx_prefix(ctx):
 # =====================================================================================
 # 6.  Closed-loop (island) alignment                                            [C5]   [5.6.2.1]
 # =====================================================================================
+# 5.6.2.1  rotate a closed loop until its start point lines up (FFT correlation)
 def fft_align_closed(A, B):
     """Cyclic-shift + winding alignment of closed contour B onto A in O(N log N). [5.6.2.1]"""
     zA = A[:, 0] + 1j * A[:, 1]
@@ -1411,6 +1459,7 @@ def coarse_align_closed(A, B, steps=50):
                 best = (ssd, aligned)
     return best[1]
 
+# 5.6.2.1  island alignment: common point count, consistent winding, rotated start
 def align_closed(A, B, params: FusionParams):
     """Dispatch closed-contour alignment to the fft or coarse method. [5.6.2.1]"""
     if params.loop_align == "coarse":
@@ -1435,6 +1484,7 @@ def _arc_dist(a1, a2, n=24):
     A, B = resample_open(a1.pts, n), resample_open(a2.pts, n)
     return float(min(np.abs(A - B).sum(), np.abs(A - B[::-1]).sum()) / n)
 
+# 5.6.1  group each arc across the subjects that have it
 def match_arcs(subj_arcs, node_map):
     """Group arcs across subjects by (code, fused end-nodes). [5.6.1.2]"""
     per, keys = {}, set()
@@ -1458,6 +1508,7 @@ def match_arcs(subj_arcs, node_map):
                 slots = [{sid: a} for a in cand]
                 continue
             C = np.array([[_arc_dist(next(iter(s.values())), a) for a in cand] for s in slots])
+            # 5.6.1  arcs paired across subjects by the same assignment solver
             r, c = linear_sum_assignment(C)
             taken = set()
             for ri, ci in zip(r, c):
@@ -1475,11 +1526,14 @@ def _blank_stat(support, dropped=False):
             "fit_residual": 0.0, "dir_gap": 1.0, "dropped": dropped, "n_pts": 0,
             "len_F": 0.0, "len_blend": 0.0}
 
+# 5.6  fuse one arc across subjects
 def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams, ref_sid):
     """Average one arc across the subjects that have it -- WITH SATM's intra-edge anchors. [5.6.6]"""
+    # 5.6.1.2  reference subject first, then the rest
     sids = sorted(group, key=lambda s: (s != ref_sid, s))            # reference first
     ref = sids[0]
     w = np.array([weights[s] for s in sids], float)
+    # 5.6.1.3  renormalise the weights over the subjects that actually have this arc
     w = w / w.sum()
     arcs = [group[s] for s in sids]
     st = _blank_stat(len(sids))
@@ -1491,6 +1545,7 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
         R = resample_closed(arcs[0].pts, n0)
         if signed_area(R) < 0:
             R = R[::-1]
+        # 5.6.2.1  islands: common point count, forced winding, rotated start
         rolled = [R] + [align_closed(R, resample_closed(a.pts, n0), params) for a in arcs[1:]]
         reps = {s: ArcRep(P, params, closed=False) for s, P in zip(sids, rolled)}
     else:
@@ -1498,12 +1553,14 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
         oriented, gaps = [], []
         for s, a in zip(sids, arcs):
             P = np.asarray(a.pts, float)
+            # 5.6.2.2  orient every arc in the reference's direction
             if node_map[s][a.n0] != nA:                 # arc runs nB -> nA; flip it
                 P = P[::-1]
             if oriented:
                 A0, B0 = resample_open(oriented[0], 32), resample_open(P, 32)
                 f = float(np.sum((A0 - B0) ** 2))
                 r = float(np.sum((A0 - B0[::-1]) ** 2))
+                # 5.6.2.3  forward vs reverse orientation difference (dir_gap)
                 gaps.append(abs(f - r) / max(f, r, 1e-9))
             oriented.append(P)
         st["dir_gap"] = float(min(gaps)) if gaps else 1.0
@@ -1513,6 +1570,7 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
     st["len_blend"] = float(np.average([reps[s].length() for s in sids], weights=w))
 
     # ---- SATM key points -> anchor table  [F1] ---------------------------------------
+    # 5.6.4 / 5.6.5  anchor table (endpoints only when keypoints=False)
     table, n_anch, dropped = anchor_table(reps, ref, params)
     st["n_anchors"], st["kp_dropped"] = n_anch, dropped
 
@@ -1522,19 +1580,24 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
     # inject_phantom_regions. So every sample-point budget/resample below sees the FINAL arc set
     # (phantoms included). A phantom LINE arc traces the seam and has real length, so it is sampled
     # and averaged pointwise against R's real arc -- pulling R's boundary smoothly onto the seam
+    # 5.6.6  piecewise fusion between consecutive anchors
     pieces = []
     for i in range(len(table[ref]) - 1):
         subs = [reps[s].sub_raw(table[s][i], table[s][i + 1]) for s in sids]
+        # 5.6.6.1  sample count for this interval from the sagitta bound
         n = segment_budget(subs, params.fit_tol_px, params.n_min_seg, params.n_max_seg,
                            params.curv_sigma_px, params.curv_sample_px, params.curv_lambda)
         if n >= params.n_max_seg:
+            # 5.6.6.1.2  saturated: the bound is still missed at n_max_seg
             st["saturated"] += 1                        # -> S7_budget_saturated
         S = np.stack([reps[s].sub(table[s][i], table[s][i + 1], n, params.curv_lambda)
                       for s in sids])
+        # 5.6.6.3  weighted pointwise mean
         pieces.append((w[:, None, None] * S).sum(axis=0))
 
     F = pieces[0]
     for p in pieces[1:]:
+        # 5.6.7 / 5.6.7.1  concatenate the pieces, dropping the duplicated anchor at each join
         F = np.vstack([F, p[1:]])                       # dedup_join: drop the repeated anchor
     F = _dedup(F)
 
@@ -1550,7 +1613,9 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
     dB = fused_xy[nB] - F[-1]
     t = arclength(F)
     t = t / t[-1] if t[-1] > 0 else np.zeros(len(F))
+    # 5.6.8.1  distribute the endpoint correction linearly along the arc
     F = F + (1 - t)[:, None] * dA + t[:, None] * dB     # snap ends + drag the body smoothly
+    # 5.6.8.2  exact endpoints, so arcs_to_graph welds them
     F[0], F[-1] = fused_xy[nA], fused_xy[nB]            # exact, so arcs_to_graph welds them
     out = Arc(key[0], F, closed=False, n0=nA, n1=nB)
     st["snap"] = float(max(np.hypot(*dA), np.hypot(*dB)))
@@ -1571,6 +1636,7 @@ class FusionResult:
     node_map: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
 
+# 5.2 - 5.7  the fusion driver
 def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, report_ctx=None):
     """Fuse one slice. [5.5-5.6]
     graphs {sid: BoundaryGraph}, weights {sid: float} or None for equal. N-subject throughout
@@ -1728,6 +1794,7 @@ def _arc_line(arc):
         return None
     return LineString([tuple(p) for p in P])
 
+# 5.7.1  drop degenerate arcs, remove duplicate geometry, optionally snap dangling ends
 def prepare_arcs(arcs, params: FusionParams):
     """P1/P2/P4/P5: clean the arc set and report exactly what was wrong with it. [5.7.1]"""
     rep = {"dropped_degenerate": 0, "dropped_duplicate": 0,
@@ -1775,6 +1842,7 @@ def prepare_arcs(arcs, params: FusionParams):
                 (clean[i].code, tuple(np.round(E[j], 2))))
     return clean, rep
 
+# 5.7.2  count crossings, split at them, polygonize into faces
 def polygonize_arcs(arcs, params: FusionParams):
     """P3/P6/P7/P8. [5.7.2]"""
     rep = {"arc_crossings": 0, "noded": False, "sliver_faces": 0, "polygonize_error": None}
@@ -1822,6 +1890,7 @@ def polygonize_arcs(arcs, params: FusionParams):
         faces = keep
     return faces, lines, rep
 
+# 5.7.2.4  fallback when polygonize fails: one ring per region, holes not represented
 def chainer_fallback(arcs, params: FusionParams):
     """P7 last resort: if polygonize cannot produce faces at all, rebuild one ring per region by
     linemerging that region's arcs. [5.7.2.4]"""
@@ -1855,6 +1924,7 @@ def chainer_fallback(arcs, params: FusionParams):
             continue
     return out
 
+# 5.7.3  assign faces to regions in four passes
 def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, next_new=None):
     """Face -> region id, in four passes ordered by how much each assumes. [5.7.3]
     Code-set intersection, then the neighbour rule, then the distance-transform seed, then an
@@ -1903,6 +1973,7 @@ def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, 
 
     flags = []
 
+    # 5.7.3.1  a face bounded by arcs takes the code common to all of them
     # ---- PASS 1: the code-set intersection ------------------------------------------
     for it in info:
         if len(it["codes"]) == 1:
@@ -1911,6 +1982,7 @@ def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, 
                 flags.append(("face_code_conflict", it["rid"], tuple(sorted(it["seeds"])),
                               round(it["face"].area, 2)))
 
+    # 5.7.3.2  neighbour rule, to a fixed point (island / donut pairs)
     # ---- PASS 2: the NEIGHBOUR RULE, to a fixed point --------------------------------
     for _ in range(len(info) + 2):
         changed = False
@@ -1937,6 +2009,7 @@ def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, 
         if not changed:
             break
 
+    # 5.7.3.3 / 5.7.3.4  distance-transform seed, then an UNLABELED id
     # ---- PASS 3 (seed) and PASS 4 (UNLABELED) ----------------------------------------
     nu = int(params.unlabeled_id_start if next_unlabeled is None else next_unlabeled)
     nn = int(params.new_id_start if next_new is None else next_new)
@@ -1972,6 +2045,7 @@ def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, 
             regions[int(it["rid"])].append(it["face"])
     return dict(regions), arc_faces, flags, nu, nn
 
+# 5.7  polygon construction end to end (5.7.6 the faces are the atlas)
 def rebuild_atlas(arcs, seeds, params: FusionParams, next_unlabeled=None, next_new=None):
     """arcs -> POLYGONS. [5.7]"""
     clean, prep = prepare_arcs(arcs, params)
@@ -1997,6 +2071,7 @@ def poly_union(faces):
     """Union a list of faces, repairing invalid ones with buffer(0). [5.7.5]"""
     return unary_union([f if f.is_valid else f.buffer(0) for f in faces])
 
+# 3.2.3.3  label anchor per region face
 def region_anchors(regions, min_area=1.0):
     """One label anchor per FACE, so islands and split regions each get their own label. [3.1.6]"""
     out = []
