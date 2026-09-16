@@ -77,8 +77,55 @@ try:
 except Exception:                                    # pragma: no cover
     _HAVE_SPLINE = False
 
-class TopologyDivergence(RuntimeError):
-    """Raised when strict_topo is on and the subjects' region-adjacency graphs disagree. [5.5.3.1]"""
+# =====================================================================================
+# Failure model  [5.9]   -- the four stages where the pipeline can break down
+# =====================================================================================
+# 5.3      topological : a region absence that phantom injection cannot resolve
+# 5.6.8.1  fusion      : an arc end that cannot be attached to its fused node in tolerance
+# 5.7.1.3  post-fusion : a dangling arc end with no node to snap to in tolerance
+# 5.7.2.4  polygonize  : polygonize failed noded AND un-noded, forcing chainer_fallback
+#
+# EVERY failure found in one stage is collected before the stage stops, so the reviewer gets
+# the whole list for that slice rather than the first item noticed. halt_on_failure=False
+# turns the whole mechanism into reporting only (the Experiment Runner's mode).
+REVIEW_STAGES = ("topological", "fusion", "post-fusion", "polygonize")
+
+@dataclass
+class SliceFailure:
+    """One located reason a slice cannot be finished. [5.9.1]"""
+    stage: str                       # one of REVIEW_STAGES
+    node: str                        # pipeline-tree node, e.g. "5.3.3.4"
+    reason: str
+    xy: tuple | None = None          # where to look on the slice, in voxels
+    code: tuple | None = None        # the region code(s) involved
+    sid: str | None = None           # subject, when the failure belongs to one
+    detail: dict = field(default_factory=dict)
+
+    def line(self, acr=None):
+        """One reviewer-facing text line. `acr` maps a region id to its abbreviation."""
+        where = "" if self.xy is None else f" @({float(self.xy[0]):.1f}, {float(self.xy[1]):.1f})"
+        who = "" if self.sid is None else f" [subject {self.sid}]"
+        what = ""
+        if self.code is not None:
+            ids = [str(acr(c)) if acr else str(int(c)) for c in self.code]
+            what = f" regions {ids}"
+        return f"{self.node}{who}{what}{where}: {self.reason}"
+
+class FusionHalt(RuntimeError):
+    """A slice stopped with a collected list of SliceFailures. [5.9]"""
+    def __init__(self, message, failures=(), slice_index=None, arcs=None):
+        super().__init__(message)
+        self.failures = list(failures)
+        self.slice_index = slice_index
+        self.arcs = list(arcs) if arcs is not None else []   # 5.9.3  what the reviewer edits
+
+    def stages(self):
+        return [st for st in REVIEW_STAGES if any(f.stage == st for f in self.failures)]
+
+class TopologyDivergence(FusionHalt):
+    """Raised when the subjects' region-adjacency graphs disagree. [5.3, 5.5.3.1]
+    Subclasses FusionHalt so `except FusionHalt` catches it and existing
+    `except TopologyDivergence` handlers keep working unchanged."""
 
 class _StageTimer:
     """Context-manager timer. `store` a dict records seconds per named stage; None disables it."""
@@ -145,6 +192,9 @@ class FusionParams:
     node_tol: float = 1.0        # WITHIN one subject: endpoints this close are one junction.
     node_match_max: float = 5.0  # ACROSS subjects: refuse to pair junctions further apart than
                                  # this. Set from measurement: ~3x S3_node_disp_p95_px.
+    snap_max_px: float | None = None  # 5.6.8.1  max distance a fused arc end may be dragged onto
+                                 # its fused node. Beyond it the arc cannot be attached and the
+                                 # slice is a `fusion` failure. None -> node_match_max.
     strict_topo: bool = True     # abort where the region-adjacency graphs diverge (SATM C2)
     strict_topo_min: float = 0.98
     # --- phantom regions (partial-coverage topology alignment; Situation 2 vs 3) -------
@@ -160,16 +210,26 @@ class FusionParams:
                                  # (a LINE phantom already has length along the border it rides).
     fragment_match_tol_px: float = 50.0   # canonicalization: max centroid distance to match a
                                           # subject fragment onto a canonical fragment
-    phantom_window_margin_px: float = 30.0  # phantom lookups search only this far around the
-                                            # template fragment (safety net for residual
-                                            # duplicate wall/junction codes, e.g. lenses)
+    phantom_window_margin_px: float = 30.0  # 5.3.3.3  TREE reduction ONLY: how far around the
+                                            # template fragment the spoke/diagonal lookup may
+                                            # reach. The LINE reduction no longer uses a window:
+                                            # it requires a globally unique host border and
+                                            # declares anything else complex (5.3.2.5).
     label_all_fragments: bool = True      # QA labels: every fragment (True) or only the
                                           # largest fragment per base region (False)
     halt_on_situation3: bool = True   # a partial region that cannot reduce to a LINE, POINT
-                                      # or CLUSTER locus stops the slice, regardless of
+                                      # or TREE locus stops the slice, regardless of
                                       # strict_topo. Averaging across a topology change gives
                                       # a locally wrong map with no warning. Set False only
                                       # to survey how often Situation 3 occurs.
+
+    # --- reviewer round-trip on failure (5.9) -----------------------------------------
+    halt_on_failure: bool = True   # 5.9  stop the slice at the first STAGE that collects any
+                                   # failure, after gathering every failure in that stage, and
+                                   # hand the slice to the reviewer. False = record them on the
+                                   # result and carry on regardless; that is the Experiment
+                                   # Runner's mode, where the point is to survey the limits of
+                                   # the pipeline rather than to produce a finished atlas.
 
     # --- policy (F4) ------------------------------------------------------------------
     orphan_policy: str = "passthrough"   # {"passthrough","drop","reference"}
@@ -235,6 +295,8 @@ class FusionParams:
     def __post_init__(self):
         if self.curv_sigma_px is None:
             self.curv_sigma_px = min(1.0, self.kp_alpha / 4.0)
+        if self.snap_max_px is None:
+            self.snap_max_px = self.node_match_max
         if self.flatten_px > self.fit_tol_px:
             warnings.warn(
                 f"flatten_px ({self.flatten_px}) > fit_tol_px ({self.fit_tol_px}). You would be "
@@ -256,7 +318,8 @@ class FusionParams:
 # =====================================================================================
 # Data model   [5.2.2]
 # =====================================================================================
-@dataclass
+@dataclass(eq=False)     # identity equality: the fields include numpy arrays, and dataclass
+                         # __eq__ on two arcs sharing a code raises instead of returning False
 class Arc:
     """One maximal boundary chain of constant code (a, b) between two junction nodes.
     A closed island loop has closed=True, n0 == n1 == None, and does not repeat its first point."""
@@ -280,27 +343,61 @@ class Arc:
 # =====================================================================================
 # A region id may cover several disconnected pieces ("fragments"). Codes are made unique
 # at the SOURCE (raster relabelling before tracing): largest piece keeps the base id,
-# piece j >= 1 gets base*FRAGMENT_MULT + j. Decoding is arithmetic (no table).
+# piece j >= 1 gets an INT16-SAFE code. Decoding is arithmetic (no table).
 # Fragments are INDEPENDENT for seeds/fusion/phantoms/registry records; ONE region for
 # QA colour, names, and the finished atlas (merge + rollup helpers below).
+#
+# 6.2.2  CODE LAYOUT. The volume is int16, so every code must be <= 32767:
+#     1 .. 999        template region ids
+#     8001 .. 8999    UNLABELED (a face the code-set rule could not decide)
+#     9001 .. 9999    expert-drawn regions
+#     10001 .. 31999  fragments: code = FRAGMENT_BLOCK0 + (j-1)*FRAGMENT_STRIDE + base
+# so fragment j of base b decodes as base = (code - 10000) % 1000, j = (code-10000)//1000 + 1.
+# No fragment code can collide with a base id because every fragment code is >= 10000.
+# The two ceilings below are HARD: exceeding either is a data limitation, not a rounding
+# error, and the pipeline stops rather than wrapping into another id block. If a real atlas
+# ever needs more, move the volume to int32 and raise FRAGMENT_MAX_INDEX / FRAGMENT_STRIDE.
 
-FRAGMENT_MULT = 10000        # every base id (template, 8001+, 9001+) is below this
+FRAGMENT_BLOCK0 = 10000      # first fragment code; every base id block sits below it
+FRAGMENT_STRIDE = 1000       # one stride per fragment index -> base must be <= 999
+FRAGMENT_MAX_INDEX = 22      # (32767 - 10000) // 1000 = 22 fragments per base region
+FRAGMENT_MAX_BASE = FRAGMENT_STRIDE - 1      # 999 distinct base region ids
+
+class FragmentCapacityError(ValueError):
+    """Raised when a slice needs more fragments, or a higher base id, than int16 allows. [6.2.2]"""
+
+def fragment_code(base, index):
+    """Fragment code for piece `index` (1-based) of base region `base`. [3.1.2.1, 6.2.2]
+    index 0 is the base id itself. Refuses to encode anything that would leave int16."""
+    base, index = int(base), int(index)
+    if index == 0:
+        return base
+    if not (1 <= base <= FRAGMENT_MAX_BASE):
+        raise FragmentCapacityError(
+            f"base region id {base} cannot be fragmented: the fragment code block only "
+            f"addresses base ids 1..{FRAGMENT_MAX_BASE} (int16 limit, 6.2.2).")
+    if not (1 <= index <= FRAGMENT_MAX_INDEX):
+        raise FragmentCapacityError(
+            f"region {base} needs fragment index {index}, over the ceiling of "
+            f"{FRAGMENT_MAX_INDEX} (int16 limit, 6.2.2). Either the slice is pathological "
+            f"or the label volume needs int32.")
+    return FRAGMENT_BLOCK0 + (index - 1) * FRAGMENT_STRIDE + base
 
 def fragment_base(code):
     """Base region id of a fragment code. [3.1.2.1]"""
     code = int(code)
-    return code // FRAGMENT_MULT if code >= FRAGMENT_MULT else code
+    return (code - FRAGMENT_BLOCK0) % FRAGMENT_STRIDE if code >= FRAGMENT_BLOCK0 else code
 
 def fragment_index(code):
     """0 for the largest/only fragment (base code), 1,2,... [3.1.2.1]"""
     code = int(code)
-    return code % FRAGMENT_MULT if code >= FRAGMENT_MULT else 0
+    return (code - FRAGMENT_BLOCK0) // FRAGMENT_STRIDE + 1 if code >= FRAGMENT_BLOCK0 else 0
 
 # 3.1.2.1  split a base id into per-component fragment codes (ab#k)
 def fragment_relabel_slice(label_slice, min_voxels=1):
     """Relabel a raster so each connected piece of each region has a unique code. [3.1.2]
-    Largest piece keeps the base id; others get base*FRAGMENT_MULT + j ordered by size. Run
-    AFTER hemisphere masking."""
+    Largest piece keeps the base id; others get fragment_code(base, j) ordered by size (6.2.2).
+    Run AFTER hemisphere masking."""
     from scipy.ndimage import label as cc_label
     lab = np.asarray(label_slice).copy()
     for rid in [int(r) for r in np.unique(lab) if int(r) != 0]:
@@ -319,7 +416,8 @@ def fragment_relabel_slice(label_slice, min_voxels=1):
             if -negsz < min_voxels:
                 lab[comps == ci] = 0
             else:
-                lab[comps == ci] = rid * FRAGMENT_MULT + j
+                # 6.2.2  raises FragmentCapacityError past 22 fragments or base id > 999
+                lab[comps == ci] = fragment_code(rid, j)
     return lab
 
 # 5.1.3.2  the template's canonical fragment table
@@ -374,7 +472,8 @@ def canonicalize_fragments(graphs, canon_table, params):
             nxt = max([fragment_index(k[0]) for k in canon] + [0]) + 1
             for c in C:
                 if c not in matched:
-                    remap[c] = base * FRAGMENT_MULT + nxt   # unmatched: fresh canonical index
+                    # 6.2.2  raises FragmentCapacityError past the int16 fragment ceiling
+                    remap[c] = fragment_code(base, nxt)     # unmatched: fresh canonical index
                     nxt += 1
         if remap:
             for gi, e in enumerate(g.elements):
@@ -420,6 +519,277 @@ def registry_base_status(reg, slice_index):
         active = (v.get("status") == "active") or (out.get(b) == "active")
         out[b] = "active" if active else "inactive"
     return out
+
+# =====================================================================================
+# 0c.  SUB-THRESHOLD REGION TRIMMING                                  [3.1.3.1 / 3.1.4.4]
+# =====================================================================================
+# A region below the voxel threshold used to be set to background, which punched a HOLE in the
+# parcellation: the hole then has to be labelled by something downstream, and "background in
+# the middle of the brain" is never the right answer. TRIM_STAGE selects the replacement:
+#
+#   "raster"  (3.1.3.1)  absorb the piece into the neighbour it shares the most boundary with,
+#                        on the label raster, BEFORE tracing. Nothing downstream ever sees it.
+#   "vector"  (3.1.4.4)  keep the piece through smoothing and simplification, then dissolve it
+#                        on the traced network: its flanking arcs are replaced by the line
+#                        running down the middle of it, so the neighbours meet along a smooth
+#                        boundary instead of along one neighbour's staircase.
+#
+# Both are area-partition simplification in the sense of van Oosterom's GAP-tree (1995): a
+# region too small to keep is not deleted, it is MERGED into a neighbour chosen by a
+# compatibility rule.
+#   "raster" uses the largest-shared-boundary rule. That is the GAP-tree's own collapse
+#   function Collapse(a, b) = f(L(a, b), CompatibleTypes(a, b), weight_factor(b)) with the type
+#   and weight terms dropped: brain regions carry no feature-classification hierarchy to
+#   compute compatibility from, so only the common-boundary length L(a, b) remains. Cheng & Li
+#   (2006) list the same longest-shared-boundary rule as one of three merge choices.
+#   "vector" dissolves the doomed polygon onto its own centre line and hands the halves to the
+#   flanking neighbours, rather than giving the whole polygon to one of them. That is the
+#   area collapse of Haunert & Sester (2008) and the skeleton-based GAP-tree extension of
+#   Ai & van Oosterom (2002); SPLITAREA (Meijers, Savino & van Oosterom 2016) is its weighted
+#   form, which this pipeline does not need because the halves are split evenly.
+
+# 3.1.3.1  TRIM_STAGE="raster": absorb a sub-threshold piece into its largest-boundary neighbour
+def absorb_small_regions(label_slice, min_voxels, background=0, max_passes=8):
+    """Reassign every connected piece below `min_voxels` to the neighbour it shares the most
+    boundary with, instead of dropping it to background. [3.1.3.1]
+    Run AFTER fragment_relabel_slice, so each piece already carries its own code.
+    Returns (relabelled slice, [(code, absorbed_into, n_voxels, n_shared_edges), ...])."""
+    lab = np.asarray(label_slice).copy()
+    bg = int(background)
+    notes = []
+    for _ in range(max_passes):
+        sizes = {int(c): int((lab == c).sum()) for c in np.unique(lab) if int(c) != bg}
+        small = sorted((n, c) for c, n in sizes.items() if n < min_voxels)
+        if not small:
+            break
+        progressed = False
+        for n_vox, code in small:
+            m = lab == code
+            if not m.any():
+                continue
+            shared = defaultdict(int)                  # 4-connected edge count per neighbour
+            for arr, msk in ((lab[:, 1:], m[:, :-1]), (lab[:, :-1], m[:, 1:]),
+                             (lab[1:, :], m[:-1, :]), (lab[:-1, :], m[1:, :])):
+                vals, cnts = np.unique(arr[msk], return_counts=True)
+                for v, c in zip(vals, cnts):
+                    if int(v) != code:
+                        shared[int(v)] += int(c)
+            # a REAL region is always preferred; background only when the piece touches
+            # nothing else, which means it is an isolated speck and dropping it is correct
+            real = {k: v for k, v in shared.items() if k != bg and sizes.get(k, 0) >= min_voxels}
+            if not real:
+                real = {k: v for k, v in shared.items() if k != bg}
+            target = max(real, key=lambda k: (real[k], -k)) if real else bg
+            lab[m] = target
+            notes.append((code, target, n_vox, int(shared.get(target, 0))))
+            progressed = True
+        if not progressed:
+            break
+    return lab, notes
+
+# 3.1.4.4  TRIM_STAGE="vector": approximate medial axis of the doomed polygon
+# NOTE ON METHOD: a STRAIGHT SKELETON is the object Haunert & Sester (2008) collapse areas onto,
+# but computing one exactly needs a CGAL binding (skgeom), which is not a dependency of this
+# pipeline. What is computed instead is the APPROXIMATE MEDIAL AXIS (Lee 1982): the interior
+# edges of the Voronoi diagram of the densely sampled boundary. Brandt & Algazi (1992) derive
+# this construction for a binary image shape and bound its error by the boundary sampling
+# density, which is what TRIM_VECTOR_SAMPLE_PX sets; Brandt (1994) gives the convergence
+# criteria. Amenta, Bern & Eppstein (1998) state the sampling requirement in terms of local
+# feature size. Everything below says "medial axis", never "skeleton", because that is what it
+# is. On a sub-threshold sliver the two objects differ by far less than one voxel, so the
+# distinction is one of naming rather than result -- but if skgeom is ever added,
+# _medial_axis_graph is the single function to swap out.
+def _medial_axis_graph(ring, sample_px=0.5):
+    """Interior Voronoi graph of a closed ring. Returns (V, edges) in ring coordinates,
+    or (None, None) when the polygon is too small or degenerate to sample. [3.1.4.4]"""
+    from scipy.spatial import Voronoi
+    poly = Polygon([tuple(q) for q in _dedup(np.asarray(ring, float))])
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.area <= 0 or poly.geom_type != "Polygon":
+        return None, None
+    B = densify(np.vstack([poly.exterior.coords]), sample_px, closed=False)
+    B = _dedup(B)
+    if len(B) < 8:
+        return None, None
+    try:
+        vor = Voronoi(B)
+    except Exception:
+        return None, None
+    V = np.asarray(vor.vertices, float)
+    inside = np.array([poly.contains(Point(float(x), float(y))) for x, y in V]) if len(V) else \
+             np.zeros(0, bool)
+    edges = [(int(a), int(b)) for a, b in vor.ridge_vertices
+             if a >= 0 and b >= 0 and inside[a] and inside[b]]
+    if not edges:
+        return None, None
+    return V, edges
+
+def _graph_path(V, edges, a, b):
+    """Shortest Euclidean path a -> b over the medial-axis graph; [] when disconnected."""
+    adj = defaultdict(list)
+    for i, j in edges:
+        d = float(np.hypot(*(V[i] - V[j])))
+        adj[i].append((j, d)); adj[j].append((i, d))
+    import heapq
+    dist, prev, pq = {a: 0.0}, {a: None}, [(0.0, a)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u == b:
+            break
+        if d > dist.get(u, float("inf")):
+            continue
+        for v2, w in adj[u]:
+            nd = d + w
+            if nd < dist.get(v2, float("inf")):
+                dist[v2] = nd; prev[v2] = u; heapq.heappush(pq, (nd, v2))
+    if b not in prev:
+        return []
+    out, u = [], b
+    while u is not None:
+        out.append(u); u = prev[u]
+    return out[::-1]
+
+def _order_region_cycle(Rarcs, R):
+    """Chain R's open boundary arcs end to end. Returns (cycle arcs, junction xy, neighbours)
+    or (None, None, None) when the boundary is not a single cycle. [3.1.4.4]"""
+    R = int(R)
+    opens = [a for a in Rarcs if not a.closed]
+    if not opens or len(opens) != len(Rarcs):
+        return None, None, None
+    ends = {}
+    for a in opens:
+        for q in (tuple(np.round(a.pts[0], 6)), tuple(np.round(a.pts[-1], 6))):
+            ends.setdefault(q, []).append(a)
+    if any(len(v) != 2 for v in ends.values()):
+        return None, None, None
+    cyc, vxy = [opens[0]], []
+    cur, node = opens[0], tuple(np.round(opens[0].pts[-1], 6))
+    start = tuple(np.round(opens[0].pts[0], 6))
+    for _ in range(len(opens) + 1):
+        vxy.append(np.asarray(node, float))
+        if node == start:
+            break
+        nxt = [a for a in ends[node] if a is not cur]
+        if not nxt:
+            return None, None, None
+        cur = nxt[0]; cyc.append(cur)
+        node = (tuple(np.round(cur.pts[-1], 6))
+                if tuple(np.round(cur.pts[0], 6)) == node
+                else tuple(np.round(cur.pts[0], 6)))
+    if len(vxy) != len(cyc):
+        return None, None, None
+    N = [next(int(c) for c in a.code if int(c) != R) for a in cyc]
+    return cyc, vxy, N
+
+# 3.1.4.4  dissolve one doomed region onto the line running down the middle of it
+def dissolve_region_vector(arcs, R, sample_px=0.5, background=0):
+    """Remove region R from an arc set by replacing its boundary with its own centre line.
+    [3.1.4.4]
+
+    2 neighbours (the sliver case): the two flanking arcs are resampled to a shared point
+    count and averaged pointwise, giving one arc coded (N1, N2) between the same two junctions.
+    3+ neighbours: a midline is undefined, so the approximate medial axis is computed and each
+    junction is joined to the medial-axis pole, giving one arc per junction coded with the two
+    neighbours that meet there.
+
+    Returns (new arc list, note) with note describing what happened, or (None, reason)."""
+    R = int(R)
+    Rarcs = [a for a in arcs if R in (int(a.code[0]), int(a.code[1]))]
+    if not Rarcs:
+        return None, f"region {R} has no arcs"
+    _rid = {id(a) for a in Rarcs}                       # identity, never ==: Arc holds arrays
+    others = [a for a in arcs if id(a) not in _rid]
+    neigh = {int(c) for a in Rarcs for c in a.code} - {R}
+    real = neigh - {int(background)}
+
+    if all(a.closed for a in Rarcs):                   # island: it simply merges into its host
+        if len(real) > 1:
+            return None, (f"region {R} is a closed island with {len(real)} real neighbours; "
+                          f"which one absorbs it is undecidable")
+        return others, f"island dissolved into {sorted(neigh)[0] if neigh else background}"
+
+    cyc, vxy, N = _order_region_cycle(Rarcs, R)
+    if cyc is None:
+        return None, f"boundary of region {R} is not a single cycle"
+    k = len(cyc)
+
+    if k == 2:                                         # ---- sliver: pointwise mean midline ---
+        A, B = cyc[0], cyc[1]
+        PA, PB = np.asarray(A.pts, float), np.asarray(B.pts, float)
+        if np.hypot(*(PA[0] - PB[0])) > np.hypot(*(PA[0] - PB[-1])):
+            PB = PB[::-1]                              # run both from the same junction
+        n = max(len(PA), len(PB), 2)
+        M = 0.5 * (resample_open(PA, n) + resample_open(PB, n))
+        M[0], M[-1] = PA[0], PA[-1]                    # junctions stay exactly put
+        code = tuple(sorted((int(N[0]), int(N[1]))))
+        return others + [Arc(code, _dedup(M), closed=False)], \
+               f"sliver dissolved to the midline of its two flanking arcs, new code {code}"
+
+    # ---- 3+ neighbours: no midline exists, so use the approximate medial axis -------------
+    ring = np.vstack([np.asarray(a.pts, float) if
+                      np.allclose(a.pts[0], vxy[i - 1]) else np.asarray(a.pts, float)[::-1]
+                      for i, a in enumerate(cyc)])
+    V, edges = _medial_axis_graph(ring, sample_px)
+    if V is None:
+        return None, (f"region {R} has {k} neighbours and its medial axis could not be "
+                      f"computed (polygon too small or degenerate)")
+    used = sorted({i for e in edges for i in e})
+    poly = Polygon([tuple(q) for q in _dedup(ring)])
+    poly = poly if poly.is_valid else poly.buffer(0)
+    # pole = the medial-axis vertex furthest from the boundary: the natural meeting point
+    pole = max(used, key=lambda i: poly.exterior.distance(Point(float(V[i][0]), float(V[i][1]))))
+    new = []
+    for i in range(k):
+        v = np.asarray(vxy[i], float)
+        t = min(used, key=lambda j: float(np.hypot(*(V[j] - v))))
+        path = _graph_path(V, edges, t, pole)
+        if not path:
+            return None, (f"region {R}: no medial-axis path from junction {i} to the pole")
+        P = np.vstack([v[None, :], V[path]])
+        code = tuple(sorted((int(N[i]), int(N[(i + 1) % k]))))
+        new.append(Arc(code, _dedup(P), closed=False))
+    return others + new, (f"{k}-neighbour region dissolved onto its approximate medial axis "
+                          f"(star of {k} arcs meeting at the pole)")
+
+# 3.1.4.4  driver: dissolve every region whose voxel count fell below the threshold
+def trim_small_regions_vector(arcs, small_codes, sample_px=0.5, background=0):
+    """Dissolve every code in `small_codes`, smallest first. [3.1.4.4]
+    Returns (arcs, [(code, note)], [(code, reason)]) -- the second list is what was dissolved,
+    the third what could not be and is left in place for the reviewer to see."""
+    done, failed = [], []
+    for code in list(small_codes):
+        out, note = dissolve_region_vector(arcs, code, sample_px, background)
+        if out is None:
+            failed.append((int(code), note))
+            continue
+        arcs = out
+        done.append((int(code), note))
+    return arcs, done, failed
+
+# =====================================================================================
+# 6.1.1  MIDLINE ARCS: delete rather than reflect
+# =====================================================================================
+def drop_midline_arcs(arcs, midline_lr, tol, outer_code=0):
+    """Remove arcs that lie ENTIRELY on the L-R midline, before the graph is rebuilt. [6.1.1]
+    Reflecting such an arc puts a wall down the centre of the brain, and polygonize then emits
+    two half-faces instead of one face spanning both hemispheres. Only an arc whose every point
+    is within `tol` of the midline AND whose non-background code is a real region is dropped,
+    so a genuine near-midline boundary between two DIFFERENT regions survives.
+    Returns (kept arcs, [(code, n_points), ...] dropped)."""
+    keep, dropped = [], []
+    out = int(outer_code)
+    for a in arcs:
+        P = np.asarray(a.pts, float)
+        on_midline = bool(np.all(np.abs(P[:, 1] - float(midline_lr)) <= float(tol)))
+        codes = [int(c) for c in a.code]
+        real = [c for c in codes if c != out]
+        # one real region against background, lying flat on the midline = the cut face
+        if on_midline and len(real) == 1 and out in codes:
+            dropped.append((tuple(codes), int(len(P))))
+            continue
+        keep.append(a)
+    return keep, dropped
 
 # =====================================================================================
 # 1.  Curvature, arc length, curvature-adaptive sampling                          [F1a]
@@ -1084,6 +1454,46 @@ def _arcs_rep_bbox(arcsC):
     P = np.vstack([np.asarray(a.pts, float) for a in arcsC])
     return P.mean(axis=0), (P.min(axis=0), P.max(axis=0))
 
+def _region_boundary_pts(arcs, R, step=1.0):
+    """Every point on R's boundary in one subject, densified to `step`. [5.3.2]"""
+    R = int(R)
+    P = [densify(np.vstack([a.pts, a.pts[0]]) if a.closed else np.asarray(a.pts, float), step)
+         for a in arcs if R in (int(a.code[0]), int(a.code[1]))]
+    return np.vstack(P) if P else np.zeros((0, 2))
+
+def _region_shape_dist(PA, PB):
+    """Symmetric mean nearest-point distance between two boundary point sets. [5.3.2]"""
+    if not len(PA) or not len(PB):
+        return float("inf")
+    return float(0.5 * (cKDTree(PB).query(PA)[0].mean() + cKDTree(PA).query(PB)[0].mean()))
+
+# 5.3.2  the phantom template comes from the subject with the most TYPICAL version of R
+def _typical_reference(haves, subj_arcs, R):
+    """The subject whose version of R has the smallest TOTAL shape distance to the others'
+    versions of R. Chosen per region, and independently of params.reference_sid, which is the
+    ARC-ORIENTATION reference for 5.6.1.1 and means something else. [5.3.2]"""
+    if len(haves) == 1:
+        return haves[0], {haves[0]: 0.0}
+    pts = {s: _region_boundary_pts(subj_arcs[s], R) for s in haves}
+    tot = {s: float(sum(_region_shape_dist(pts[s], pts[t]) for t in haves if t != s))
+           for s in haves}
+    return min(haves, key=lambda s: (tot[s], haves.index(s))), tot
+
+# 5.3.2  cyclic correspondence: same neighbours in the same cyclic order
+def _cyclic_match(A, B):
+    """True when cyclic sequence B is a rotation of A, or of A reversed. Reversal is allowed
+    because two subjects may have traced R's boundary in opposite directions. [5.3.2]"""
+    A, B = list(A), list(B)
+    if len(A) != len(B):
+        return False
+    if not A:
+        return True
+    D, n = A + A, len(A)
+    for cand in (B, B[::-1]):
+        if any(D[i:i + n] == cand for i in range(n)):
+            return True
+    return False
+
 def _in_window(xy, bbox, margin):
     lo, hi = bbox
     return (lo[0] - margin <= xy[0] <= hi[0] + margin and
@@ -1178,24 +1588,37 @@ def _inject_point_phantom(R, s, tmpl, seed, subj_arcs, params):
 
 # 5.3.3.2  lens -> line: cut the host border and collapse R's boundary onto it
 def _inject_line_phantom(R, s, tmpl, subj_arcs, params):
+    """5.3.2.5: the host border is looked up across the WHOLE slice and must be UNIQUE. A wall
+    code names "the border between these two regions", and one connected region that wraps
+    around and meets its neighbour twice produces that code twice with nothing to choose
+    between them. Fragment relabelling separates every case it can; whatever it cannot is
+    declared complex here rather than resolved by guessing which border is nearer."""
     pair = tuple(sorted(int(x) for x in tmpl["neigh"]))
-    m = float(params.phantom_window_margin_px)
     hosts = [a for a in subj_arcs[s] if not a.closed
-             and tuple(sorted(int(c) for c in a.code)) == pair
-             and _in_window(np.asarray(a.pts, float).mean(axis=0), tmpl["bbox"], m)]
+             and tuple(sorted(int(c) for c in a.code)) == pair]
     if len(hosts) != 1:
-        return None, f"host border {pair} not unique in window ({len(hosts)} found)"
+        return None, (f"host border {pair} is not unique on this slice ({len(hosts)} found); "
+                      f"fragment relabelling could not separate them, so which border R "
+                      f"collapses onto is undecidable (5.3.2.5)")
     H = hosts[0]
     feet = [_project_to_polyline(H.pts, q) for q in tmpl["v_xy"][:2]]
     ts = sorted(f[0] for f in feet)
     if not (1e-6 < ts[0] and ts[-1] < H.length() - 1e-6 and ts[-1] - ts[0] > 1e-6):
         return None, f"feet of fragment {R} not interior to host border {pair}"
-    pieces = _split_polyline_at(H.pts, feet)
-    subj_arcs[s].remove(H)
-    for p in pieces:
-        subj_arcs[s].append(Arc(tuple(int(c) for c in H.code), p, closed=False))
     f0, f1 = sorted(feet, key=lambda f: f[0])
     seg = np.vstack([np.asarray(f0[1], float), np.asarray(f1[1], float)])
+    # 5.3.3.2  the host border is CUT, not merely split: between the two feet the neighbours
+    # are separated by R, so that stretch is no longer a wall between them. It is dropped, the
+    # same absorption the tree reduction performs on its diagonals at 5.3.3.3.7.
+    _k = lambda q: (round(float(q[0]), 9), round(float(q[1]), 9))
+    _feet = {_k(f0[1]), _k(f1[1])}
+    pieces = [p for p in _split_polyline_at(H.pts, feet)
+              if {_k(p[0]), _k(p[-1])} != _feet]
+    # identity, never list.remove: Arc.__eq__ compares numpy arrays and raises on two arcs
+    # that happen to share a code
+    subj_arcs[s][:] = [a for a in subj_arcs[s] if a is not H]
+    for p in pieces:
+        subj_arcs[s].append(Arc(tuple(int(c) for c in H.code), p, closed=False))
     for a in tmpl["arcs"]:
         if not a.closed:
             subj_arcs[s].append(Arc(tuple(int(c) for c in a.code), seg.copy(),
@@ -1220,17 +1643,19 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
                       or _in_window(node_xy[a.n1], tmpl["bbox"], m))]
         if not cands:
             return None, f"spoke {pair} of fragment {R} missing in window"
-        a = min(cands, key=lambda a: min(
-            np.hypot(*(np.asarray(node_xy[a.n0], float) - vxy)),
-            np.hypot(*(np.asarray(node_xy[a.n1], float) - vxy))))
+        if len(cands) > 1:                               # 5.3.2.5  ambiguity is never guessed
+            return None, (f"spoke {pair} of fragment {R} is not unique in window "
+                          f"({len(cands)} candidates); which one pins junction {i} is "
+                          f"undecidable")
+        a = cands[0]
         k0 = frozenset(int(x) for x in node_regs[a.n0])
         k1 = frozenset(int(x) for x in node_regs[a.n1])
         if (k0 == fk) != (k1 == fk):
             t = a.n1 if k0 == fk else a.n0               # far end identified by region set
-        else:                                            # duplicate far keys: nearest wins
-            d0 = np.hypot(*(np.asarray(node_xy[a.n0], float) - vxy))
-            d1 = np.hypot(*(np.asarray(node_xy[a.n1], float) - vxy))
-            t = a.n0 if d0 <= d1 else a.n1
+        else:                                            # 5.3.2.5  both ends or neither match
+            return None, (f"far end of spoke {pair} of fragment {R} is undecidable at "
+                          f"junction {i}: the region sets at its two ends do not distinguish "
+                          f"them")
         end = 0 if t == a.n0 else 1
         if (id(a), end) in taken:
             return None, f"spoke end contested at junction {i} of fragment {R}"
@@ -1272,13 +1697,15 @@ def _tree_reduction(R, tmpl, s, subj_arcs, node_xy, node_regs, params):
     if seen != J:
         return None, f"new arcs around fragment {R} are disconnected from a pin"
     new_ids = {id(a) for a in NEW}
-    # 5.3.3.3.4  no arc outside the tree may end at a pinned junction
-    for a in Sarcs:                                      # foreign arc at a pinned junction:
-        if id(a) in new_ids or id(a) in spoke_ids:       # catches T1 flips (C1) and adjacent
-            continue                                     # missing clusters (B3) in one net
+    # 5.3.3.3.4  an arc that is neither a spoke nor a collected diagonal, yet ends at a pinned
+    # junction, means the local topology is not the one the template describes. One net catches
+    # both T1 flips (C1) and adjacent missing clusters (B3).
+    for a in Sarcs:
+        if id(a) in new_ids or id(a) in spoke_ids:
+            continue
         if a.n0 in J or a.n1 in J:
-            return None, (f"foreign arc {tuple(sorted(int(c) for c in a.code))} ends at "
-                          f"a pinned junction of fragment {R}")
+            return None, (f"arc {tuple(sorted(int(c) for c in a.code))} is neither a spoke nor "
+                          f"a collected diagonal, yet ends at a pinned junction of fragment {R}")
     # 5.3.3.3.3  route each boundary arc as the unique tree path t_i-1 -> t_i
     paths, use = [], defaultdict(int)                    # -- 4. paths [Thm 2d] + cover [2e]
     for i in range(k):
@@ -1339,50 +1766,103 @@ def _inject_tree_phantom(R, s, tmpl, t_nodes, paths, NEW, spoke_ends,
     subj_arcs[s][:] = [a for a in subj_arcs[s] if id(a) not in new_ids]
     return tuple(float(x) for x in node_xy[t_nodes[0]]), len(NEW)
 
-# 5.3  inject phantom regions (5.3.1 neighbour-set agreement, 5.3.4 records)
+# 5.3  inject phantom regions (5.3.1 neighbour-set + cyclic agreement, 5.3.4 records)
 def inject_phantom_regions(subj_arcs, subj_xy, subj_regs, seeds, params):
     """Fragment-code-scoped phantom injection (Situation 2); mutates subj_arcs in place. [5.3]
-    Records: inserted [(rid, sid, kind, xy)] with kind in {point, line, tree/<n>diag}; complex_
-    [(rid, sid, reason, xy)]."""
-    if not params.phantom_regions:
-        return [], []
-    sids = list(subj_arcs)
-    present = {s: _present_region_ids(subj_arcs[s]) for s in sids}
-    outer = int(params.outer_code)
-    all_ids = set().union(*present.values()) - {outer}
-    seed_xy = {int(r): np.asarray(pt, float) for pt, r in seeds}
 
-    inserted, complex_ = [], []
+    Returns three lists:
+      inserted    [(rid, sid, kind, xy)]      kind in {point, line, tree/<n>diag}
+      complex_    [(rid, sid, reason, xy)]    Situation 3: the slice cannot be fused
+      independent [rid, ...]                  Situation 1: present in some subjects and
+                                              bordering NOTHING the lacking subjects have, so
+                                              there is no shared boundary to pin a phantom to.
+                                              Carried through at full geometry.
+
+    BACKGROUND (params.outer_code) is never a region here: it is excluded from the set of ids
+    considered for injection, and excluded from every presence test. It is kept in a fragment's
+    NEIGHBOUR set only because "R borders background" is what distinguishes a lens from an
+    island, never as something a subject can be said to have or lack.
+
+    ONE TEMPLATE PER REGION [5.3.2]: the template is built from the subject with the most
+    typical version of R, and every other subject that has R must agree with it on the
+    neighbour SET and on the cyclic ORDER of those neighbours. Any disagreement is complex --
+    the pipeline does not build a second template for a second arrangement."""
+    if not params.phantom_regions:
+        return [], [], []
+    sids = list(subj_arcs)
+    outer = int(params.outer_code)
+    # background is not a region: drop it from every presence set, not just from all_ids
+    present = {s: (_present_region_ids(subj_arcs[s]) - {outer}) for s in sids}
+    all_ids = set().union(*present.values()) if present else set()
+    seed_xy = {int(r): np.asarray(pt, float) for pt, r in seeds if int(r) != outer}
+
+    inserted, complex_, independent = [], [], []
     for R in sorted(all_ids):
         haves = [s for s in sids if R in present[s]]
         lacks = [s for s in sids if R not in present[s]]
         if not lacks or not haves:
             continue
-        ref = haves[0]
-        if getattr(params, "reference_sid", None) in haves:
-            ref = params.reference_sid
+        # 5.3.2  per-region reference: the most typical version of R, not params.reference_sid
+        ref, _tot = _typical_reference(haves, subj_arcs, R)
         tmpl, why = _fragment_template(subj_arcs[ref], subj_xy[ref], subj_regs[ref],
                                        R, params)
         if tmpl is None:
             complex_.append((R, ref, why, (float("nan"),) * 2))
             continue
-        agree = True                                     # have-subjects agree [decision A8]
-        for s2 in haves[1:]:
-            t2, _w = _fragment_template(subj_arcs[s2], subj_xy[s2], subj_regs[s2],
-                                        R, params)
-            if t2 is None or set(t2["neigh"]) != set(tmpl["neigh"]):
-                complex_.append((R, s2, f"subjects disagree on neighbours of fragment {R}",
+        # 5.3.1  every have-subject must match the ONE template: same neighbour set AND the
+        # same cyclic order around R. Every disagreement is recorded, not just the first.
+        agree = True
+        for s2 in haves:
+            if s2 == ref:
+                continue
+            t2, w2 = _fragment_template(subj_arcs[s2], subj_xy[s2], subj_regs[s2], R, params)
+            if t2 is None:
+                complex_.append((R, s2, f"fragment {R} unreadable in this subject: {w2}",
                                  tuple(float(x) for x in tmpl["rep"])))
                 agree = False
-                break
+                continue
+            if set(t2["neigh"]) != set(tmpl["neigh"]):
+                complex_.append((R, s2, f"subjects disagree on the neighbours of fragment {R}: "
+                                 f"{sorted(int(x) for x in t2['neigh'])} vs "
+                                 f"{sorted(int(x) for x in tmpl['neigh'])} in the template "
+                                 f"subject {ref}",
+                                 tuple(float(x) for x in tmpl["rep"])))
+                agree = False
+                continue
+            # 5.3.2  cyclic correspondence (islands have no boundary cycle to compare)
+            if tmpl["kind"] == "cycle" and t2["kind"] == "cycle":
+                if not _cyclic_match(tmpl["N"], t2["N"]):
+                    complex_.append((R, s2, f"subjects disagree on the CYCLIC ORDER of the "
+                                     f"neighbours of fragment {R}: {list(t2['N'])} is not a "
+                                     f"rotation (or reversal) of {list(tmpl['N'])} in the "
+                                     f"template subject {ref}",
+                                     tuple(float(x) for x in tmpl["rep"])))
+                    agree = False
+            elif tmpl["kind"] != t2["kind"]:
+                complex_.append((R, s2, f"fragment {R} is an {t2['kind']} here but an "
+                                 f"{tmpl['kind']} in the template subject {ref}",
+                                 tuple(float(x) for x in tmpl["rep"])))
+                agree = False
         if not agree:
             continue
         kind = _classify_fragment(tmpl, params)
+        real_neigh = {int(nb) for nb in tmpl["neigh"]} - {outer}   # background is not a region
         for s in lacks:
-            if any(int(nb) != outer and int(nb) not in present[s]
-                   for nb in tmpl["neigh"]):             # adjacent missing cluster [A7/B3]
-                complex_.append((R, s, f"fragment {R} borders a region absent in subject "
-                                 f"{s} (adjacent missing cluster, B3)",
+            missing = [nb for nb in real_neigh if nb not in present[s]]
+            if missing:
+                if len(missing) == len(real_neigh):
+                    # SITUATION 1: not one of R's real neighbours exists in this subject, so
+                    # there is no shared boundary anywhere to pin a phantom to. R (and whatever
+                    # it is clustered with) is coverage this subject simply lacks: carried
+                    # through at full geometry. A cluster with even ONE shared neighbour does
+                    # NOT land here -- that member is handled on its own pass round this loop
+                    # and is complex, which stops the slice, so only clusters bounded entirely
+                    # by background survive as independent.
+                    independent.append(R)
+                    continue
+                complex_.append((R, s, f"fragment {R} borders region(s) "
+                                 f"{sorted(missing)} that are absent in subject {s}, while "
+                                 f"other neighbours are present (adjacent missing cluster, B3)",
                                  tuple(float(x) for x in tmpl["rep"])))
                 continue
             if kind.startswith("complex"):
@@ -1409,7 +1889,7 @@ def inject_phantom_regions(subj_arcs, subj_xy, subj_regs, seeds, params):
                 inserted.append((R, s, kind, xy))
             else:
                 complex_.append((R, s, why, tuple(float(x) for x in tmpl["rep"])))
-    return inserted, complex_
+    return inserted, complex_, sorted(set(independent))
 
 def _acr(rid, ctx):
     """Region acronym for reports, falling back to the numeric id when no LUT is supplied."""
@@ -1635,6 +2115,8 @@ class FusionResult:
     subj_nodes: dict = field(default_factory=dict)
     node_map: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
+    failures: list = field(default_factory=list)   # 5.9  SliceFailure, collected not raised
+    phantom: dict = field(default_factory=dict)    # 5.3.4  inserted / complex / independent
 
 # 5.2 - 5.7  the fusion driver
 def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, report_ctx=None):
@@ -1689,11 +2171,13 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
             if _s in _phantoms:
                 _phantoms[_s] += 1
         # sort key: most nodes (-count), then fewest phantoms (+count), then first sid (stable)
-        if phantom_independent:
-            print(f"  note: {len(phantom_independent)} independent region(s) "
+        ref_sid = min(sids, key=lambda s: (-_nodes[s], _phantoms[s], sids.index(s)))
+
+    # 5.3.4  Situation 1 note, printed whichever way the reference was chosen
+    if phantom_independent:
+        print(f"  note: {len(phantom_independent)} independent region(s) "
               f"{[_acr(r, report_ctx) for r in phantom_independent[:8]]} carried through at "
               f"full geometry (Situation 1: no shared boundary to pin a phantom to).")
-        ref_sid = min(sids, key=lambda s: (-_nodes[s], _phantoms[s], sids.index(s)))
 
     fused_xy, node_map, nstats = match_nodes(subj_nodes, weights, params, subj_phantom)
 
@@ -1718,15 +2202,35 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
     # Both abort, and both are reported with the SAME detail (run prefix / slice / acronyms /
     n_conflict = len(nstats["rejected_far"]) + len(nstats["unmatched"])
     n_isolating = len(nstats["rejected_isolating"]) + len(nstats["unmatched_isolating"])
+    # 5.9  EVERY topological failure on this slice is collected before the stage stops
+    topo_failures = []
+    for (_R, _s, _reason, _xy) in phantom_complex:
+        topo_failures.append(SliceFailure(
+            "topological", "5.3.3.4", _reason,
+            xy=(None if not np.isfinite(_xy).all() else tuple(float(v) for v in _xy)),
+            code=(int(_R),), sid=_s))
+    for (_s, _key, _d) in nstats["rejected_far"]:
+        topo_failures.append(SliceFailure(
+            "topological", "5.5.1.2",
+            f"junction rejected: {float(_d):.2f}px apart, over node_match_max = "
+            f"{params.node_match_max}px", code=tuple(int(r) for r in _key), sid=_s,
+            detail={"displacement_px": float(_d)}))
+    for (_s, _key) in nstats["unmatched"]:
+        topo_failures.append(SliceFailure(
+            "topological", "5.5.3.3", "junction present in this subject only, and its regions "
+            "are not exclusive to it, so it is a conflict rather than coverage",
+            code=tuple(int(r) for r in _key), sid=_s))
+
     if len(sids) > 1 and (phantom_complex or n_conflict):
         lines = ["TOPOLOGY DIVERGENCE (Situation 3): the region-adjacency graphs disagree in a "
                  "way that is NOT a clean partial-coverage difference, so averaging is unsafe here."]
         if phantom_complex:
             lines.append(f"  {len(phantom_complex)} region absence(s) could not be reduced to a "
-                         "single point or border:")
+                         "single point, border or tree:")
             for (_R, _s, _reason, _xy) in phantom_complex:
-                lines.append(f"    - region {_acr(_R, report_ctx)} in subject {_s} "
-                             f"@({float(_xy[0]):.1f}, {float(_xy[1]):.1f}): {_reason}")
+                _w = ("" if not np.isfinite(_xy).all()
+                      else f" @({float(_xy[0]):.1f}, {float(_xy[1]):.1f})")
+                lines.append(f"    - region {_acr(_R, report_ctx)} in subject {_s}{_w}: {_reason}")
         if n_conflict:
             lines.append(f"  S3_node_match_rate = {match_rate:.3f} (diagnostic only); "
                          f"{len(nstats['rejected_far'])} conflicting junction(s) beyond "
@@ -1740,10 +2244,11 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
                              f"{[_acr(_r, report_ctx) for _r in _key]}")
         lines.append("  Fix the QA, raise node_match_max, or set strict_topo=False to proceed.")
         msg = _ctx_prefix(report_ctx) + chr(10).join(lines)
-        if phantom_complex and params.halt_on_situation3:
-            raise TopologyDivergence(msg)     # Situation 3 is never downgraded to a warning
-        if params.strict_topo:
-            raise TopologyDivergence(msg)
+        _halt = params.halt_on_failure and (params.strict_topo or
+                                            (phantom_complex and params.halt_on_situation3))
+        if _halt:
+            raise TopologyDivergence(msg, failures=topo_failures,
+                                     slice_index=(report_ctx or {}).get("slice_index"))
         warnings.warn(msg)
     elif len(sids) > 1 and n_isolating:
         print(f"  note: {n_isolating} isolating junction(s) from {len(nstats['single_subject_rids'])} "
@@ -1772,11 +2277,38 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
         fused_arcs.append(arc)                          # NOT rounded: full float internally
         astats.append(st)
 
-    return FusionResult(arcs=fused_arcs, graph=arcs_to_graph(fused_arcs), fused_xy=fused_xy,
-                        subj_arcs=subj_arcs, subj_nodes=subj_nodes, node_map=node_map,
-                        stats={"nodes": nstats, "arcs": astats, "n_subjects": n_sub,
-                               "weights": weights, "ref_sid": ref_sid,
-                               "node_match_rate": match_rate})
+    # 5.6.8.1  an arc end that has to be dragged further than snap_max_px to reach its fused
+    # node was never really attached to it. Every such arc on the slice is collected first.
+    snap_max = float(params.snap_max_px if params.snap_max_px is not None
+                     else params.node_match_max)
+    fuse_failures = []
+    for arc, st in zip(fused_arcs, astats):
+        if st.get("dropped") or float(st.get("snap", 0.0)) <= snap_max:
+            continue
+        fuse_failures.append(SliceFailure(
+            "fusion", "5.6.8.1",
+            f"arc end dragged {float(st['snap']):.2f}px onto its fused node, over "
+            f"snap_max_px = {snap_max}px: the arc and the node do not correspond",
+            xy=tuple(float(v) for v in np.asarray(arc.pts, float).mean(axis=0)),
+            code=tuple(int(c) for c in arc.code),
+            detail={"snap_px": float(st["snap"]), "support": int(st.get("support", 0))}))
+
+    res = FusionResult(arcs=fused_arcs, graph=arcs_to_graph(fused_arcs), fused_xy=fused_xy,
+                       subj_arcs=subj_arcs, subj_nodes=subj_nodes, node_map=node_map,
+                       stats={"nodes": nstats, "arcs": astats, "n_subjects": n_sub,
+                              "weights": weights, "ref_sid": ref_sid,
+                              "node_match_rate": match_rate},
+                       failures=list(topo_failures) + fuse_failures,
+                       phantom={"inserted": phantom_inserted, "complex": phantom_complex,
+                                "independent": phantom_independent})
+    if fuse_failures and params.halt_on_failure:
+        raise FusionHalt(_ctx_prefix(report_ctx) +
+                         f"FUSION HALTED: {len(fuse_failures)} arc end(s) could not be attached "
+                         f"to their fused node within snap_max_px = {snap_max}px.",
+                         failures=fuse_failures,
+                         slice_index=(report_ctx or {}).get("slice_index"),
+                         arcs=fused_arcs)
+    return res
 
 # =====================================================================================
 # 9.  REBUILD -- THE POLYGONS ARE THE ATLAS                                 [F5 / C3]   [5.7]
@@ -1831,13 +2363,25 @@ def prepare_arcs(arcs, params: FusionParams):
         if params.repair_dangling and cand:
             k = min(cand, key=lambda k: np.hypot(*(E[k] - E[j])))
             d = float(np.hypot(*(E[k] - E[j])))
+            # 5.7.1.3  the correction is DISTRIBUTED linearly over the arc's own arc-length
+            # parameterisation, exactly as 5.6.8.1 does when snapping a fused end to its node:
+            # full at the end being moved, zero at the far end. Moving the single endpoint
+            # instead would put a kink at the last vertex.
             P = clean[i].pts.copy()
-            P[0 if which == 0 else -1] = E[k]
+            dvec = E[k] - P[0 if which == 0 else -1]
+            t = arclength(P)
+            t = t / t[-1] if t[-1] > 0 else np.zeros(len(P))
+            wgt = (1.0 - t) if which == 0 else t
+            P = P + wgt[:, None] * dvec
+            P[0 if which == 0 else -1] = E[k]            # exact, so the ends weld
             clean[i] = Arc(clean[i].code, P, clean[i].closed,
                            clean[i].n0, clean[i].n1, clean[i].sid)
             E[j] = E[k]
             rep["dangling_repaired"].append((clean[i].code, round(d, 3)))
         else:
+            # 5.7.1.3  no node within dangle_repair_px: this end cannot be attached at all,
+            # which leaves the region open. Recorded here; rebuild_atlas turns it into a
+            # `post-fusion` failure and the slice goes to the reviewer.
             rep["dangling_unrepaired"].append(
                 (clean[i].code, tuple(np.round(E[j], 2))))
     return clean, rep
@@ -2047,25 +2591,45 @@ def assign_faces(faces, arcs, seeds, params: FusionParams, next_unlabeled=None, 
 
 # 5.7  polygon construction end to end (5.7.6 the faces are the atlas)
 def rebuild_atlas(arcs, seeds, params: FusionParams, next_unlabeled=None, next_new=None):
-    """arcs -> POLYGONS. [5.7]"""
+    """arcs -> POLYGONS. [5.7]
+    Also returns `failures`: every 5.7.1.3 (post-fusion) and 5.7.2.4 (polygonize) failure found,
+    collected in full rather than stopping at the first."""
     clean, prep = prepare_arcs(arcs, params)
     faces, lines, prep2 = polygonize_arcs(clean, params)
     prep.update(prep2)
     prep["fallback_chainer"] = False
+
+    # 5.7.1.3  every unattachable dangling end on the slice
+    failures = [SliceFailure(
+        "post-fusion", "5.7.1.3",
+        f"dangling arc end with no node within dangle_repair_px = "
+        f"{params.dangle_repair_px}px; the region it bounds is left open",
+        xy=tuple(float(v) for v in _xy), code=tuple(int(c) for c in _code))
+        for (_code, _xy) in prep.get("dangling_unrepaired", [])]
 
     if not faces:
         fb = chainer_fallback(clean, params)
         prep["fallback_chainer"] = True
         prep["polygonize_error"] = (prep.get("polygonize_error")
                                     or "polygonize produced 0 faces")
+        # 5.7.2.4  the chainer rebuilds one ring per region and cannot represent holes, so its
+        # output is not an atlas. Reaching it is a failure, not a degraded success.
+        failures.append(SliceFailure(
+            "polygonize", "5.7.2.4",
+            f"polygonize produced no faces noded OR un-noded, so the chainer fallback ran; "
+            f"its one-ring-per-region output cannot represent holes and is not usable "
+            f"({prep['polygonize_error']})",
+            detail={"polygonize_error": prep["polygonize_error"]}))
         return {"regions": fb, "faces": [], "arcs": clean, "arc_faces": [0] * len(clean),
                 "flags": [("polygonize_failed", prep["polygonize_error"])],
-                "report": prep, "next_unlabeled": next_unlabeled, "next_new": next_new}
+                "report": prep, "failures": failures,
+                "next_unlabeled": next_unlabeled, "next_new": next_new}
 
     regions, arc_faces, flags, nu, nn = assign_faces(faces, clean, seeds, params,
                                                      next_unlabeled, next_new)
     return {"regions": regions, "faces": faces, "arcs": clean, "arc_faces": arc_faces,
-            "flags": flags, "report": prep, "next_unlabeled": nu, "next_new": nn}
+            "flags": flags, "report": prep, "failures": failures,
+            "next_unlabeled": nu, "next_new": nn}
 
 def poly_union(faces):
     """Union a list of faces, repairing invalid ones with buffer(0). [5.7.5]"""
@@ -2627,6 +3191,8 @@ def registry_inactive(reg, slice_index):
 def _subject_regions(res, seeds, params):
     """Each subject's OWN polygons -- the reference the S6/S7 metrics are measured against."""
     out = {}
+    # halt_on_failure is irrelevant here (rebuild_atlas only RETURNS failures; it never raises),
+    # and a subject's own QA gaps must not stop the fused slice, so they are simply not read.
     for sid, arcs in res.subj_arcs.items():
         # exclude phantom arcs: a subject's own reference atlas is its ORIGINAL geometry
         rb = rebuild_atlas([a for a in arcs if not getattr(a, 'phantom', False)], seeds, params)
@@ -2657,13 +3223,26 @@ def run_fusion(graphs, seeds, expected_ids, weights=None, params: FusionParams =
         regions = rb["regions"]
         anchors = anchors_from_regions(regions)
 
+        # 5.9  post-fusion (5.7.1.3) and polygonize (5.7.2.4) failures are collected TOGETHER,
+        # so a slice with both is reported once with both, not stopped at the first.
+        rb_failures = rb.get("failures", [])
+        if rb_failures:
+            res.failures.extend(rb_failures)
+            if params.halt_on_failure:
+                _stages = sorted({f.stage for f in rb_failures})
+                raise FusionHalt(
+                    _ctx_prefix(report_ctx) +
+                    f"REBUILD HALTED: {len(rb_failures)} failure(s) in {_stages}.",
+                    failures=rb_failures, slice_index=slice_index,
+                    arcs=rb.get("arcs") or res.arcs)
+
         if registry is not None:
             registry = registry_update(registry, slice_index, present=list(regions),
                                        expected=expected_ids, run_id=run_id,
                                        next_new=rb["next_new"], next_unlabeled=rb["next_unlabeled"],
                                        params=params)
     else:
-        rb = {"regions": {}, "faces": [], "arcs": res.arcs, "flags": [],
+        rb = {"regions": {}, "faces": [], "arcs": res.arcs, "flags": [], "failures": [],
               "next_new": None, "next_unlabeled": None}
         regions, anchors = {}, []
         print("  [build_polygons=False] STOPPED AT LINES: no polygonize, no labels, "  # TROUBLESHOOTING PRINT
@@ -2714,6 +3293,7 @@ def run_fusion(graphs, seeds, expected_ids, weights=None, params: FusionParams =
             "arcs": res.arcs, "rebuild": rb,
             "faces": rb["faces"], "regions": regions, "anchors": anchors,
             "flags": rb["flags"], "subj_regions": subj_regions,
+            "failures": res.failures, "phantom": res.phantom,     # 5.9 / 5.3.4
             "registry": registry, "diag": d}
 
 # =====================================================================================
@@ -2751,6 +3331,7 @@ def sweep_identity(graphs, params: FusionParams = None, step=0.5):
         p2 = FusionParams(**{**params.__dict__})
         p2.strict_topo = False                      # a one-hot run must not abort on topology
         p2.phantom_regions = False                  # nor inject phantoms (would perturb identity)
+        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
         res = fuse_graphs(graphs, weights={s: (1.0 if s == i else 1e-12) for s in sids},
                           params=p2)
         out[i] = _curve_dist(res.arcs, graph_to_arcs(graphs[i]), step)
@@ -2781,6 +3362,7 @@ def sweep_weights(graphs, seeds, expected_ids, pair=None, steps=11,
         p2 = FusionParams(**{**params.__dict__})
         p2.strict_topo = False
         p2.phantom_regions = False                  # weight sweep must recover inputs at w=0/1
+        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
         try:
             out = run_fusion({a: graphs[a], b: graphs[b]}, seeds, expected_ids, weights=wts,
                              params=p2, slice_index=0, verbose=False)

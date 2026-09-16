@@ -1,10 +1,9 @@
-
-MACAQUE MRI ATLAS -- PIPELINE TREE v3
+MACAQUE MRI ATLAS -- PIPELINE TREE v4
 Numbering is N.M.K. Every notebook cell header and function docstring cites the node it
 implements, so a node number is a search key across all four notebooks and edge_fusion.py.
 Comment markers [^cNN] are carried over unchanged from v2; the comment bodies are at the end.
-Nodes marked (v3) are implemented but were absent from v2.
- 
+Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against v3.
+
 - 0 Setup
   - 0.1 Mount Drive and install dependencies
   - 0.2 Import helper modules from modules/ (boundary_graph, edge_fusion, contour_fusion)
@@ -21,7 +20,7 @@ Nodes marked (v3) are implemented but were absent from v2.
     - 0.4.6 Fusion parameters (5)
     - 0.4.7 Mirror and volume parameters (6)
     - 0.4.8 Diagnostic parameters
- 
+
 - 1 Preprocessing
   - 1.1 Preprocess scans
     - 1.1.1 Bruker -> NIfTI conversion
@@ -36,7 +35,7 @@ Nodes marked (v3) are implemented but were absent from v2.
     - 1.2.2 A _zfix scan supersedes the un-fixed file; the two are never mixed in one subject
     - 1.2.3 Copy each scan to local disk once; every later stage reads the local copy
     - 1.2.4 Orientation report (axis labelling and voxel size per subject vs template)
- 
+
 - 2 Initial registration
   - 2.1 Affine transformation (subject -> template) using ANTs registration
     - 2.1.1 Confirm all files exist
@@ -46,8 +45,8 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 2.1.2.3 Similarity driven by MMI (Mattes Mutual Information)[^c4]
     - 2.1.3 Emit registration products on template grid
       - 2.1.3.1 Forward and inverse transforms recorded[^c5]
-    - 2.1.4 (v3) Cache fingerprinting
-      - 2.1.4.1 A fingerprint of the template registered TO is stored beside each transform
+    - 2.1.4 (v3) Cache key
+      - 2.1.4.1 A cache key of the template registered TO is stored beside each transform
       - 2.1.4.2 A cache built against a different template is rejected, not silently reused
   - 2.2 Score and gate
     - 2.2.1 Normalized cross-correlation between warped subjects and template
@@ -61,6 +60,10 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 2.2.6.3 Occupancy extents
       - 2.2.6.4 Empirical volume scale vs the affine determinant
       - 2.2.6.5 Obliquity
+      - 2.2.6.6 (v4) Compact per-subject table (subject | det | total rotation | anisotropy |
+                tilt | empirical-vs-det gap). transform_report returns the FULL dict and the
+                key numbers become PASS/WARN lines in report_outputs: determinant sign,
+                det-vs-empirical gap (DET_GAP_MAX) and obliquity
   - 2.3 Collapse to larger resolution in shared grid[^c6]
     - 2.3.1 Determine target voxel size
       - 2.3.1.1 Maintain in-plane resolution, restore subjects' through-plane resolution
@@ -74,7 +77,7 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 2.3.4.1 From original images, forward transform is applied onto the reference grid,
                 collapsing into a single interpolation
     - 2.3.5 Record and verify the new grid and registration outputs
- 
+
 - 3 Parcellation and Initial Export
   - 3.1 Parcellation
     - 3.1.1 Apply hemisphere mask (zeroes out right hemisphere)[^c8]
@@ -85,16 +88,33 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 3.1.2.3 Fragments below the voxel threshold are dropped with their base region
       - 3.1.2.4 Region tables and SVG labels emit the fragment code, not the base id
     - 3.1.3 Trace boundaries into a graph
-      - 3.1.3.1 Drop voxels below certain threshold[^c9] (delete tiny regions)
+      - 3.1.3.1 (v4) Sub-threshold regions, TRIM_STAGE="raster"[^c9]: a piece below the voxel
+                threshold is ABSORBED into the neighbour it shares the most boundary with, on
+                the raster, before tracing. It is never turned into a background hole. A piece
+                touching only background is the sole case that still goes to background
       - 3.1.3.2 Walk slice and record when voxels change regions
       - 3.1.3.3 Each segment records the two regions it separates
       - 3.1.3.4 Merge segments with same region boundaries into polylines
     - 3.1.4 Smoothing and simplification
       - 3.1.4.1 Gaussian low-pass filter[^c10][^c11]
       - 3.1.4.2 Simplification via Douglas-Pecker algorithm
-      - 3.1.4.3 (v3) Handle budget: TRACE_MAX_HANDLES caps handles per boundary by raising
+      - 3.1.4.3 (v3) Vertex budget: TRACE_MAX_VERTICES caps vertices per boundary by raising
                 the Douglas-Peucker tolerance until the budget is met. Lossy; the worst
-                deviation incurred is reported. None = keep the DP vertices.
+                deviation incurred is reported. None = NO LIMIT.
+        - 3.1.4.3.1 (v4) TRACE_FORCE_VERTICES also ADDS vertices until the count matches the
+                budget exactly. Lossless: every added vertex is the midpoint of an existing
+                segment, so the curve does not move
+      - 3.1.4.4 (v4) Sub-threshold regions, TRIM_STAGE="vector": the piece is kept through
+                3.1.4 and then DISSOLVED onto its own centre line
+        - 3.1.4.4.1 Exactly 2 neighbours (the sliver case): the two flanking arcs are
+                resampled to a shared point count and averaged pointwise, giving one arc
+                coded with the two neighbours, between the same two junctions
+        - 3.1.4.4.2 3+ neighbours, where no midline is defined: the APPROXIMATE MEDIAL AXIS
+                (interior Voronoi edges of the densely sampled boundary) is computed and each
+                junction is joined to the medial-axis pole, giving one arc per junction coded
+                with the two neighbours meeting there
+        - 3.1.4.4.3 A closed island with one real neighbour is deleted, merging it into that
+                neighbour. Anything else is left in place and reported
     - 3.1.5 Separate closed rings and open arcs[^c12]
     - 3.1.6 Compute seeds[^c13]
       - 3.1.6.1 (v3) A seed is the distance-transform maximum of the region's voxel mask
@@ -102,8 +122,9 @@ Nodes marked (v3) are implemented but were absent from v2.
     - 3.1.7 Template graph identically applied to every slice
     - 3.1.8 Written as ASCII line file
     - 3.1.9 (v3) Trace cache
-      - 3.1.9.1 The trace is cached under a fingerprint of the label volume plus the trace
-                parameters, so changing either invalidates the cache instead of reusing it
+      - 3.1.9.1 The trace is cached under a CACHE KEY of the label volume plus the trace
+                parameters (including trim_stage, trace_max_vertices, trace_force_vertices),
+                so changing any of them invalidates the cache instead of reusing it
   - 3.2 Export slices for correction
     - 3.2.1 Loads "warped"[^c14] T1 as underlay
     - 3.2.2 Re-masks label slice to chosen hemisphere[^c15]
@@ -116,11 +137,11 @@ Nodes marked (v3) are implemented but were absent from v2.
                 independently. The pair is collapsed back to one line on import (4.4.6).
     - 3.2.4 Write region reference table
     - 3.2.5 Output SVG
-    - 3.2.6 (v3) Round-trip gate
+    - 3.2.6 (v3) Export / re-import verification gate
       - 3.2.6.1 The written SVG is re-imported and rejected unless every region code
                 survives and the geometry error is within tolerance
     - 3.2.7 (v3) Auto-copy of exports into qc/ for review alongside the run's diagnostics
- 
+
 - 4 Expert correction and alignment (manual)
   - 4.1 (if necessary) Re-register the parcellation to each slice
   - 4.2 Adjust the lines to fit the regions of each scan (through Illustrator or another tool)
@@ -135,7 +156,7 @@ Nodes marked (v3) are implemented but were absent from v2.
     - 4.4.5 (v3) A closed path with no parseable code becomes a new expert region id (9001+);
             an open path with no code is ignored but counted in the import report
     - 4.4.6 (v3) Double-line pairs (3.2.3.4) are collapsed back to a single line
- 
+
 - 5 Contour Fusion[^c18]
   - 5.1 Setup
     - 5.1.1 Load fusion parameters
@@ -155,17 +176,27 @@ Nodes marked (v3) are implemented but were absent from v2.
   - 5.3 Inject phantom regions
     - 5.3.1 Verify all subjects that HAVE region R agree on its neighbour set -> disagreement
             is a complex case (halt)
-    - 5.3.2 Template built for every symmetrically different region R (from reference subject
-            if it has R, else first subject that does)
+    - 5.3.2 (v4) ONE template per region R, built from the subject with the MOST TYPICAL
+            version of R: smallest total shape distance to the other subjects' versions of R.
+            Chosen per region and independently of params.reference_sid, which is the
+            arc-orientation reference of 5.6.1.1 and means something else.
+            Every other subject that has R must agree with that one template on BOTH the
+            neighbour SET and the CYCLIC ORDER of those neighbours (up to rotation and
+            reversal, since subjects may trace in either direction). Any disagreement is a
+            complex case; a second template is never built for a second arrangement
       - 5.3.2.1 Bounding arcs
       - 5.3.2.2 Neighbor codes (background counts as a neighbour)
       - 5.3.2.3 Ordered boundary cycle: arcs chained end-to-end around R -> cyclic neighbour
                 order N_1 ... N_k and boundary junctions v_1 ... v_k
       - 5.3.2.4 Spoke per junction: the wall arc N_i|N_{i+1} at v_i (degree-4+ junction on R's
                 boundary -> complex case, dedicated reason)
-      - 5.3.2.5 (v3) Lookups are restricted to phantom_window_margin_px around the template
-                fragment, so residual duplicate wall/junction codes cannot be matched across
-                the slice
+      - 5.3.2.5 (v4) Ambiguity is declared COMPLEX, never guessed. The LINE reduction looks
+                its host border up across the WHOLE slice and requires it to be UNIQUE; where
+                fragment relabelling cannot separate two borders carrying the same wall code,
+                which one R collapses onto is undecidable and the slice stops. The TREE
+                reduction still scopes its spoke/diagonal lookup to phantom_window_margin_px,
+                but a non-unique spoke, or a far end its region sets do not distinguish, is
+                complex rather than resolved by nearest-wins
     - 5.3.3 Reduce region R for addition to other subject(s)
       - 5.3.3.1 Island (all bounding arcs closed, <= 1 real neighbor) -> reduces to point
         - 5.3.3.1.1 Collapse R's boundary to a tiny copy at centroid/seed point (unchanged)
@@ -184,7 +215,8 @@ Nodes marked (v3) are implemented but were absent from v2.
         - 5.3.3.3.3 Route each boundary arc R|N_i as the unique tree path from t_{i-1} to t_i
                     (may be zero-length when both pins coincide)
         - 5.3.3.3.4 Verify the double cover: every diagonal is traced by exactly two boundary
-                    paths; no foreign arc ends at any pinned junction
+                    paths; no arc that is neither a spoke nor a collected diagonal ends at any
+                    pinned junction
         - 5.3.3.3.5 Specially mark (label) each spoke's near end and each phantom arc end so
                     superimposed junctions stay distinct until after node fusion
         - 5.3.3.3.6 Add the phantom boundary arcs (zero-length, or arc-length-parametrized
@@ -192,14 +224,21 @@ Nodes marked (v3) are implemented but were absent from v2.
         - 5.3.3.3.7 Absorb the diagonals: remove them from the lacking subject's arc set (their
                     geometry now lives inside the phantom arcs)
       - 5.3.3.4 Other (complex) cases -> Halts contour fusion for that slice (failure mode)
-        - 5.3.3.4.1 Includes: spoke missing or ambiguous, new arcs not a tree, foreign arc at a
-                    pinned junction, degree-4 junction on R's boundary in the template,
-                    adjacent missing-region clusters
+        - 5.3.3.4.1 Includes: spoke missing or ambiguous, new arcs not a tree, an arc that is
+                    neither a spoke nor a collected diagonal ending at a pinned junction,
+                    degree-4 junction on R's boundary in the template, adjacent missing-region
+                    clusters, neighbour-set or cyclic-order disagreement (5.3.2)
         - 5.3.3.4.2 Records location of failure
         - 5.3.3.4.3 halt_on_situation3 stops the slice regardless of strict_topo; set False
                     only to survey how often the case occurs
     - 5.3.4 Output records of added phantom regions (kind: point / line / tree, with diagonal
-            count) and complex cases
+            count), complex cases, and (v4) INDEPENDENT regions
+      - 5.3.4.1 (v4) Situation 1: a region whose real neighbours are ALL absent from the
+                lacking subject has no shared boundary anywhere to pin a phantom to, so it is
+                carried through at full geometry instead of halting. Background is never
+                counted as a neighbour for this test. A cluster with even ONE shared neighbour
+                does not qualify: that member is complex on its own pass and stops the slice,
+                so only clusters bounded entirely by background survive as independent
   - 5.4 Decompose updated per-slice graph into arcs[^c23] + nodes (second pass)
     - 5.4.1 Find arc endpoints within tolerance -> node junctions[^c24]
     - 5.4.2 Record closed island loops (no nodes)
@@ -242,8 +281,9 @@ Nodes marked (v3) are implemented but were absent from v2.
         - 5.6.4.3.1 Keypoints with 2+ matches get added
         - 5.6.4.3.2 Subjects missing an anchor get a replacement via linear interpolation
                     between existing anchors
-      - 5.6.4.4 (v3) Anchors are filtered to the largest fragment per base region when
-                label_all_fragments is False
+      - 5.6.4.4 (v3) LABEL ANCHORS (the per-face points the QA text is placed at, NOT the
+                intra-arc fusion anchors of 5.6.4 and not kp_anchors) are filtered to the
+                largest fragment per base region when label_all_fragments is False
     - 5.6.5 Create anchor table per-arc (keypoints = False)
       - 5.6.5.1 Anchor table only returns [0, 1] (endpoints)
     - 5.6.6 Piecewise fusion between consecutive anchors
@@ -267,12 +307,20 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 5.7.1.1 Drop degenerate arcs
       - 5.7.1.2 Remove duplicate geometry
       - 5.7.1.3 (optional) Snap dangling ends to nodes within tolerance
+        - 5.7.1.3.1 (v4) The correction is DISTRIBUTED linearly over the arc's own arc-length
+                parameterisation, exactly as 5.6.8.1 does, so the body follows the end instead
+                of a kink appearing at the last vertex
+        - 5.7.1.3.2 (v4) An end with no node inside dangle_repair_px cannot be attached: it is
+                a `post-fusion` failure, fusion stops for that slice, and it goes to 5.9
     - 5.7.2 Polygonize arcs
       - 5.7.2.1 Count interior arc crossings
       - 5.7.2.2 Split arcs at crossings
       - 5.7.2.3 Produce faces using polygonize
       - 5.7.2.4 If error arises, try un-noded, then rebuild one ring per region (won't
                 represent holes, not ideal)
+        - 5.7.2.4.1 (v4) Reaching chainer_fallback is a `polygonize` FAILURE, not a degraded
+                success: its one-ring-per-region output cannot represent holes, so the slice
+                stops and goes to 5.9
     - 5.7.3 Assign faces to regions
       - 5.7.3.1 A face bounded by arcs takes the common region ID
       - 5.7.3.2 Neighbor rule is used to resolve island / donut pairs[^c39]
@@ -297,10 +345,45 @@ Nodes marked (v3) are implemented but were absent from v2.
             map, within fit_tol*3 + node_tol/2
     - 5.8.4 M8 weight sweep: fused output tracked across the weight simplex
     - 5.8.5 Reference-subject ladder is exercised by S7_sweep_identity, not assumed
- 
+  - 5.9 (v4) Post-QA reviewer round-trip   (FULL and TEST only; see 5.9.6)
+    - 5.9.1 Four failure points, each stopping the slice after EVERY failure in that stage has
+            been collected -- never on the first one noticed
+      - 5.9.1.1 topological  (5.3): a region absence phantom injection cannot resolve
+      - 5.9.1.2 fusion       (5.6.8.1): an arc end that cannot be attached to its fused node
+                within snap_max_px
+      - 5.9.1.3 post-fusion  (5.7.1.3): a dangling end with no node inside dangle_repair_px
+      - 5.9.1.4 polygonize   (5.7.2.4): polygonize failed noded AND un-noded
+    - 5.9.2 A topological failure exports ONE SVG PER SUBJECT, in QA style on that subject's
+            own scan -- the same thing the reviewer imported at 5.1.2 -- plus a superimposition
+            of all subjects in the style of E0_5_fusion_demo: shades of BLUE for subjects that
+            HAVE the region, shades of RED for subjects that LACK it. The superimposition is a
+            visual aid and is not read back; every edit is made on the per-subject SVGs
+    - 5.9.3 Every other failure exports ONE SVG of the FUSED lines, in QA style (3.2.5) but
+            with NO scan underlay, because a fusion reflects no subject
+    - 5.9.4 Output tree: RUN_DIR/postqa_review/<failure point>/slice_<NNN>/ holding the SVG(s)
+            and failures.txt, which lists every failure point on that slice and why it failed.
+            The failure-point folders are topological, fusion, post-fusion and polygonize
+    - 5.9.5 The reviewer edits the SVG in place; the next run reads it back, repeats the stage
+            that failed, and either continues or raises again. Reporting fusion errors, taking
+            the fix back in, continuing, and then reporting separate post-fusion or polygonize
+            errors is the expected sequence
+    - 5.9.6 STAGE GATE: all slices must pass one check before the run moves on to the next
+            series of checks, so the run always reports the EARLIEST failing stage across every
+            slice. halt_on_failure=False turns the whole mechanism into reporting only; the
+            Experiment Runner forces it off, because that notebook exists to survey the limits
+            of the pipeline and keeps its existing report-all / reject-all behaviour
+    - 5.9.7 Diagnostics reflect the FINAL product only. A slice that failed, was corrected and
+            then passed contributes its passing numbers; the failure is not carried into 5.8
+
 - 6 Conversion to volumetric model[^c41]
   - 6.1 Mirror Hemisphere back for Bilateral Symmetry
     - 6.1.1 Reflect kept-hemisphere graph across the L-R midline
+      - 6.1.1.1 (v4) Arcs lying ENTIRELY on the midline are DELETED rather than reflected,
+                BEFORE arcs_to_graph, so polygonize sees no wall and produces one face
+                spanning both hemispheres. Only an arc whose every point is within
+                MIRROR_WELD_TOL of the midline AND whose non-background code is a real region
+                is deleted, so a genuine near-midline boundary between two DIFFERENT regions
+                survives
     - 6.1.2 Weld the reflection to the original at the midline
       - 6.1.2.1 Merge coincident nodes along the midline seam
       - 6.1.2.2 Drop duplicated midline arcs so that faces can merge across the center
@@ -311,6 +394,15 @@ Nodes marked (v3) are implemented but were absent from v2.
   - 6.2 Rasterize polygonized atlas into a labeled volume
     - 6.2.1 Load template label volume for grid dimensions and affine[^c43]
     - 6.2.2 Allocate an empty int16[^c44] volume, set background ID to zero
+      - 6.2.2.1 (v4) INT16-SAFE ID LAYOUT. 1-999 template regions, 8001-8999 UNLABELED,
+                9001-9999 expert-drawn, 10001-31999 fragments. A fragment code is
+                10000 + (j-1)*1000 + base, so base = (code-10000) % 1000 and
+                j = (code-10000)//1000 + 1: decoding stays arithmetic with no lookup table,
+                and no fragment code can collide with a base id because every one is >= 10000
+      - 6.2.2.2 (v4) The two ceilings are HARD and the pipeline REFUSES to run past either:
+                more than 22 fragments of one region, or a base id over 999. Both are data
+                limitations of int16, not rounding errors; if a real atlas ever needs more,
+                move the volume to int32 and raise the ceilings
     - 6.2.3 Per-Slice Work
       - 6.2.3.1 Merges every multi-polygon into single list of polygons
       - 6.2.3.2 Sort each polygon face by area in descending order
@@ -323,8 +415,14 @@ Nodes marked (v3) are implemented but were absent from v2.
       - 6.2.4.3 Skip slices with no faces
     - 6.2.5 Verify orientation on a representative slice (overlay vs template, IoU[^c45])
     - 6.2.6 Unresolved faces carry unlabeled IDs into the volume as a stray material
+      - 6.2.6.1 (v4) The LUT writer renders EVERY unlabeled id (8000s) as ONE colour, magenta,
+                so a QA gap reads as a single stray material instead of a scatter of
+                differently-coloured regions that look like real anatomy
     - 6.2.7 (v3) Filled-atlas preview and export
-      - 6.2.7.1 Rendered over a subject underlay
+      - 6.2.7.1 (v4) UNDERLAY_SUBJECT is None by DEFAULT: no subject underlay, which is the
+                deliverable. Setting a subject id is an explicit DIAGNOSTIC option and tags the
+                output filename "DIAGNOSTIC_on_<sid>", so such a render can never be mistaken
+                for the deliverable
       - 6.2.7.2 Coloured variant (LUT colours) and normal variant (region ids)
   - 6.3 Write the Label Volume in M3C's input format (SPR/SDT)
     - 6.3.1 Assert that the in-plane grid as a square

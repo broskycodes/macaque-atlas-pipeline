@@ -31,26 +31,40 @@ class BoundaryGraph:
     _grid: dict = field(default_factory=dict, repr=False, compare=False)
     _pts:  list = field(default_factory=list, repr=False, compare=False)
 
+    def _open_buffer(self, tol):
+        """Seed the insert buffer and its grid hash from whatever .nodes currently holds."""
+        self._pts = [np.asarray(p, float) for p in self.nodes]
+        self._grid = {}
+        for j, p in enumerate(self._pts):
+            self._grid.setdefault((round(p[0] / tol), round(p[1] / tol)), []).append(j)
+
     def add_node(self, xy, tol=1e-6):
         """Add a node, reusing an existing one within `tol`. Grid-hashed for O(1) average
-        insert (was O(n): a linear scan + per-call vstack, i.e. O(n^2) to build a graph)."""
+        insert. .nodes is NOT rebuilt per insert (that was O(n) per call, O(n^2) per graph):
+        call finalize_nodes() once after the insert loop. Replacing .nodes by hand after an
+        insert run invalidates the buffer; build a new BoundaryGraph instead."""
         xy = np.asarray(xy, float)
-        if not hasattr(self, "_grid"):           # lazy: works no matter how nodes was set
-            self._grid = {}
-            for j, p in enumerate(self.nodes):
-                self._grid.setdefault((round(p[0] / tol), round(p[1] / tol)), []).append(j)
-            self._pending = list(self.nodes)     # python list we can append to cheaply
+        if not self._pts:
+            self._open_buffer(tol)
         cell = (round(float(xy[0]) / tol), round(float(xy[1]) / tol))
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for j in self._grid.get((cell[0] + dx, cell[1] + dy), ()):
-                    if np.hypot(*(self._pending[j] - xy)) <= tol:
+                    if np.hypot(*(self._pts[j] - xy)) <= tol:
                         return j
-        j = len(self._pending)
-        self._pending.append(xy)
+        j = len(self._pts)
+        self._pts.append(xy)
         self._grid.setdefault(cell, []).append(j)
-        self.nodes = np.asarray(self._pending, float).reshape(-1, 2)   # keep .nodes valid
         return j
+
+    def finalize_nodes(self):
+        """Materialise .nodes from the deferred insert buffer. Call once after a run of
+        add_node calls. Idempotent; a no-op when nothing was deferred."""
+        if self._pts:
+            self.nodes = np.asarray(self._pts, float).reshape(-1, 2)
+        elif self.nodes is None or not len(self.nodes):
+            self.nodes = np.zeros((0, 2))
+        return self.nodes
 
     def add_element(self, i, j, matA=-1, matB=-1):
         if i == j:
@@ -96,6 +110,7 @@ def polyline_to_graph(polylines, merge_tol=None, box_frac=3e-8):
             if prev is not None:
                 g.add_element(prev, ni)
             prev = ni
+    g.finalize_nodes()
     return g
 
 

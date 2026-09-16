@@ -99,5 +99,5 @@ def fused_contours_to_graph(fused_contours, merge_tol=None):
         closed = np.vstack([contour, contour[0]])
         polylines.append(closed)
         seeds.append((tuple(contour.mean(axis=0)), int(region_id)))
-    g = bg.polyline_to_graph(polylines, merge_tol=merge_tol)
+    g = bg.polyline_to_graph(polylines, merge_tol=merge_tol)   # finalizes .nodes itself
     return g, seeds
