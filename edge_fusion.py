@@ -191,7 +191,13 @@ class FusionParams:
                                  # present in only one tracing harmless instead of corrupting.
 
     # --- correspondence (F2, F3) ------------------------------------------------------
-    node_tol: float = 1.0        # WITHIN one subject: endpoints this close are one junction.
+    node_tol: float = 0.1        # (v5) WITHIN one subject: endpoints this close are one
+                                 # junction. The trace puts junctions on a HALF-INTEGER voxel
+                                 # lattice, so two distinct junctions are commonly exactly 1.0
+                                 # px apart: node_tol must stay well under that or the merge
+                                 # decision flips between subjects and the topology diverges.
+                                 # It is a coincidence tolerance (Illustrator round-off, an
+                                 # end that should touch but does not), NOT a feature scale.
     node_match_max: float = 5.0  # ACROSS subjects: refuse to pair junctions further apart than
                                  # this. Set from measurement: ~3x S3_node_disp_p95_px.
     snap_max_px: float | None = None  # 5.6.8.1  max distance a fused arc end may be dragged onto
@@ -234,14 +240,20 @@ class FusionParams:
                                    # the pipeline rather than to produce a finished atlas.
 
     # --- policy (F4) ------------------------------------------------------------------
-    orphan_policy: str = "passthrough"   # {"passthrough","drop","reference"}
-    #   passthrough : keep an arc seen by >= min_arc_support subjects, average those. Asserts
-    #                 the tracer who DREW it was right. Right default for an ATLAS.
-    #   drop        : discard any arc not seen by ALL subjects (SATM's behaviour). Asserts the
-    #                 tracer who OMITTED it was right. Right for a CONSENSUS task. Note this
-    #                 opens the region -> it becomes an UNLABELED face, visibly, by design.
+    orphan_region_policy: str = "passthrough"   # (v5, was orphan_policy) {"passthrough",
+                                 # "drop","reference"}. 5.6.1.4 admits a group here ONLY when a
+                                 # whole REGION is absent from the lacking subjects (Situation 1
+                                 # of 5.3.4.1); every other partial group is a correspondence
+                                 # failure and is refused, not passed through.
+    #   passthrough : keep the missing region's arcs, from the >= min_region_support subjects
+    #                 that have it. Asserts the tracer who DREW it was right. Atlas default.
+    #   drop        : discard the region unless ALL subjects have it (SATM's behaviour).
+    #                 Asserts the tracer who OMITTED it was right. Right for a CONSENSUS task.
+    #                 Note this opens the host -> an UNLABELED face appears, visibly, by design.
     #   reference   : take the reference subject's version verbatim; drop if the ref lacks it.
-    min_arc_support: int = 1     # passthrough only. len(subjects) = unanimity; ceil(N/2) = vote.
+    min_region_support: int = 1   # (v5, was min_arc_support) passthrough only: how many
+                                 # subjects must carry the missing region. len(subjects) =
+                                 # unanimity; ceil(N/2) = vote.
     reference_sid: str | None = None   # None -> the subject with the most arcs
 
     # --- closed loops (islands) ------------------------------------------------------- [C5]
@@ -311,9 +323,9 @@ class FusionParams:
                 f"~{self.curv_sigma_px}px are invisible to the key-point detector.")
         if self.representation == "spline" and not _HAVE_SPLINE:
             raise ImportError("representation='spline' needs scipy.interpolate.splprep")
-        if self.orphan_policy not in ("passthrough", "drop", "reference"):
-            raise ValueError(f"orphan_policy must be passthrough|drop|reference, "
-                             f"got {self.orphan_policy!r}")
+        if self.orphan_region_policy not in ("passthrough", "drop", "reference"):
+            raise ValueError(f"orphan_region_policy must be passthrough|drop|reference, "
+                             f"got {self.orphan_region_policy!r}")
         if self.loop_align not in ("fft", "coarse"):
             raise ValueError(f"loop_align must be fft|coarse, got {self.loop_align!r}")
 
@@ -786,6 +798,17 @@ def graph_to_arcs(g, sid=None):
     junc = {n for n in inc if is_junction(n)}
     used, arcs = set(), []
 
+    # 3.1.3.5 (v5)  carry the TEMPLATE's junction identity onto the arc ends. build_nodes
+    # groups ends by label instead of by distance, so a junction the template defined can be
+    # neither split nor merged by any later geometry change.
+    _J = getattr(g, "junctions", None)
+
+    def jlabel(n):
+        if _J is None or n >= len(_J):
+            return None
+        v = int(_J[n])
+        return f"J{v}" if v >= 0 else None
+
     def walk(start_node, start_e, stop_at_junction):
         path, cur_n, cur_e = [start_node], start_node, start_e
         while True:
@@ -808,7 +831,12 @@ def graph_to_arcs(g, sid=None):
             path = walk(j, ei, stop_at_junction=True)
             closed = (path[0] == path[-1] and len(path) > 3)
             pts = nodes[path[:-1]] if closed else nodes[path]
-            arcs.append(Arc(_code_of(g.elements[ei]), pts, closed, sid=sid))
+            a = Arc(_code_of(g.elements[ei]), pts, closed, sid=sid)
+            if not closed:
+                l0, l1 = jlabel(path[0]), jlabel(path[-1])
+                if l0 is not None or l1 is not None:
+                    a.plabels = (l0, l1)
+            arcs.append(a)
 
     for ei, e in enumerate(g.elements):                 # leftovers: node-free island loops
         if ei in used:
@@ -816,7 +844,12 @@ def graph_to_arcs(g, sid=None):
         path = walk(int(e[0]), ei, stop_at_junction=False)
         closed = (path[0] == path[-1] and len(path) > 3)
         pts = nodes[path[:-1]] if closed else nodes[path]
-        arcs.append(Arc(_code_of(e), pts, closed, sid=sid))
+        a = Arc(_code_of(e), pts, closed, sid=sid)
+        if not closed:
+            l0, l1 = jlabel(path[0]), jlabel(path[-1])
+            if l0 is not None or l1 is not None:
+                a.plabels = (l0, l1)
+        arcs.append(a)
 
     return [a for a in arcs if len(_dedup(a.pts)) >= 2]
 
@@ -893,10 +926,24 @@ def arcs_to_node_graph(arcs, weld=1e-9, verify=True):
 # =====================================================================================
 # 4.  NODES: cluster within a subject, then match across subjects   [5.2.2.1, 5.5.1]   [F2, F3]
 # =====================================================================================
+# 3.1.3.5 (v5)  two label namespaces share Arc.plabels and must not be confused
+def is_template_label(lab):
+    """True for a junction id carried from the template ('J<k>'). [3.1.3.5]"""
+    return isinstance(lab, str) and lab.startswith("J")
+
+
+def is_phantom_label(lab):
+    """True for a phantom triple-point mark ('phT<R>_<sid>_<i>'). [5.3.3.3.5]"""
+    return isinstance(lab, str) and lab.startswith("ph")
+
+
 # 5.2.2.1  cluster arc endpoints within a subject into node junctions
 def build_nodes(arcs, params: FusionParams):
-    """Cluster the endpoints of all OPEN arcs into junction nodes (single-link at node_tol).
-    [5.2.2.1]"""
+    """Cluster the endpoints of all OPEN arcs into junction nodes. [5.2.2.1]
+    Ends carrying a label (a template junction id, or a phantom mark) are grouped by that
+    label and never by distance; only unlabelled ends -- which after v5 means ends the
+    REVIEWER created -- fall back to single-link clustering at node_tol.
+    Returns (node_xy, node_regions, node_phantom, node_label)."""
     pts, ref, labels = [], [], []
     for i, arc in enumerate(arcs):
         if arc.closed:
@@ -905,7 +952,7 @@ def build_nodes(arcs, params: FusionParams):
         pts.append(arc.pts[0]);  ref.append((i, 0)); labels.append(pl[0] if pl else None)
         pts.append(arc.pts[-1]); ref.append((i, 1)); labels.append(pl[1] if pl else None)
     if not pts:
-        return np.zeros((0, 2)), [], []
+        return np.zeros((0, 2)), [], [], []
 
     P = np.asarray(pts, float)
     parent = list(range(len(P)))
@@ -926,6 +973,11 @@ def build_nodes(arcs, params: FusionParams):
             continue
         if labels[i] is not None or labels[j] is not None:  # labeled ends do NOT cluster by
             continue                                        # geometry (superimposed phantom junctions)
+        # 5.2.2.1 (v5)  two ends weld only if their arcs SHARE a region. A junction is where
+        # regions meet, so two boundaries with no region in common cannot be one junction
+        # however close they pass.
+        if not (set(arcs[ref[i][0]].code) & set(arcs[ref[j][0]].code)):
+            continue
         union(i, j)
     lab_groups = defaultdict(list)                      # ends sharing a label -> ONE node
     for _idx, _lab in enumerate(labels):
@@ -939,35 +991,78 @@ def build_nodes(arcs, params: FusionParams):
     for i in range(len(P)):
         groups[find(i)].append(i)
 
-    node_xy, node_regions, node_phantom = [], [], []
+    node_xy, node_regions, node_phantom, node_label = [], [], [], []
     for k, root in enumerate(sorted(groups)):
         idxs = groups[root]
         node_xy.append(P[idxs].mean(axis=0))
-        regs, all_phantom, has_label = set(), True, False
+        regs, all_phantom, has_phantom_label, lab = set(), True, False, None
         for i in idxs:
             ai, end = ref[i]
             regs.update(arcs[ai].code)
             all_phantom = all_phantom and bool(getattr(arcs[ai], 'phantom', False))
-            if labels[i] is not None:                   # a labeled end = a phantom triple-point
-                has_label = True
+            if is_phantom_label(labels[i]):             # a phantom triple-point
+                has_phantom_label = True
+            if lab is None and labels[i] is not None:
+                lab = labels[i]
             if end == 0:
                 arcs[ai].n0 = k
             else:
                 arcs[ai].n1 = k
         node_regions.append(frozenset(regs))
-        node_phantom.append(all_phantom or has_label)
-    return np.asarray(node_xy, float), node_regions, node_phantom
+        # a TEMPLATE junction id is real anatomy, so it must NOT inherit the phantom
+        # displacement-gate exemption that a phantom mark carries
+        node_phantom.append(all_phantom or has_phantom_label)
+        node_label.append(lab)
+    return np.asarray(node_xy, float), node_regions, node_phantom, node_label
 
 # 5.5.1  match node junctions across subjects
-def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
+def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None,
+                subj_label=None):
     """Nodes are grouped by their incident REGION SET -- a topological key that is GIVEN by the
-    labels, where SATM has to infer correspondence from geometry. [5.5.1]"""
+    labels, where SATM has to infer correspondence from geometry. [5.5.1]
+    (v5) A junction that still carries its TEMPLATE id is paired by that id first (5.5.1.0):
+    the id is identical across subjects by construction, so it needs no key and no distance.
+    Everything the reviewer created is unlabelled and goes through the region-set path below,
+    unchanged."""
     sids = list(subj_nodes)
+    subj_label = subj_label or {}
+
+    # 5.5.1.0 (v5)  identity pairing on the carried template junction id
+    label_slots, claimed = {}, {sid: set() for sid in sids}
+    for sid in sids:
+        for i, lab in enumerate(subj_label.get(sid, []) or []):
+            if not is_template_label(lab):
+                continue
+            label_slots.setdefault(lab, {})[sid] = i
+    # 5.5.1.0.1  INTEGRITY. An id only means anything when every subject inherited it from
+    # ONE template (3.1.7). A reviewer edit can legitimately change the regions at a few
+    # junctions, so a handful of disagreements just drops those ids back to the region-set
+    # path; wholesale disagreement means the graphs were numbered independently and NO id is
+    # trustworthy, so they are all discarded rather than silently mismatching everything.
+    _id_conflict = [lab for lab, slot in label_slots.items()
+                    if len({frozenset(subj_nodes[s][1][i]) for s, i in slot.items()}) > 1]
+    _id_distrust = len(_id_conflict) > max(3, 0.10 * max(len(label_slots), 1))
+    if _id_distrust:
+        warnings.warn(
+            f"5.5.1.0.1: {len(_id_conflict)} of {len(label_slots)} template junction ids "
+            f"disagree on their incident regions across subjects. The graphs were not "
+            f"numbered from one template (3.1.7), so every id is discarded and 5.5.1.1 "
+            f"falls back to region-set matching.")
+        label_slots = {}
+    else:
+        for lab in _id_conflict:
+            label_slots.pop(lab, None)
+        for lab, slot in label_slots.items():
+            for sid, i in slot.items():
+                claimed[sid].add(i)
+
     per, keys = {}, set()
     for sid, (xy, regs) in subj_nodes.items():
         d = defaultdict(list)
         # 5.5.1.1  key each junction by its incident region set
         for i, k in enumerate(regs):
+            if i in claimed[sid]:
+                continue
             d[k].append(i)
         per[sid] = d
         keys |= set(d)
@@ -988,7 +1083,9 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
 
     stats = {"collision_keys": [], "unmatched": [], "disp": [], "rejected_far": [],
              "unmatched_isolating": [], "rejected_isolating": [],
-             "single_subject_rids": sorted(_single_subject_rids)}
+             "single_subject_rids": sorted(_single_subject_rids),
+             "id_paired": len(label_slots), "id_conflict": len(_id_conflict),
+             "id_distrusted": bool(_id_distrust)}
 
     for key in sorted(keys, key=lambda s: tuple(sorted(s))):
         counts = {sid: len(per[sid].get(key, [])) for sid in sids}
@@ -1043,12 +1140,39 @@ def match_nodes(subj_nodes, weights, params: FusionParams, subj_phantom=None):
             for sid, i in slot.items():
                 node_map[sid][i] = fi
 
+    # 5.5.1.0 (v5)  template-id slots. A label carried by only SOME subjects means the reviewer
+    # removed or replaced that junction in the others: a real topology change, reported exactly
+    # like a region-set miss so 5.5.3 / 5.9 handle it the same way.
+    for lab in sorted(label_slots):
+        slot = label_slots[lab]
+        _regs = set()
+        for sid, i in slot.items():
+            _regs |= set(subj_nodes[sid][1][i])
+        _key = tuple(sorted(int(r) for r in _regs))
+        if len(slot) > 1:
+            _pos = np.array([subj_nodes[s][0][i] for s, i in slot.items()], float)
+            stats["disp"].extend(
+                float(np.hypot(*(p - _pos.mean(axis=0)))) for p in _pos)
+        for sid in sids:
+            if sid in slot:
+                continue
+            if _is_isolating(frozenset(_regs)):
+                stats["unmatched_isolating"].append((sid, _key))
+            else:
+                stats["unmatched"].append((sid, _key))
+        fi = len(fused_xy)
+        fused_xy.append(_slot_pos(slot, subj_nodes, weights))
+        for sid, i in slot.items():
+            node_map[sid][i] = fi
+
     return np.asarray(fused_xy, float), node_map, stats
 
 def _slot_pos(slot, subj_nodes, weights):
     w = np.array([weights[sid] for sid in slot], float)
     # 5.5.2  weights normalised over the subjects present at this junction
-    w = w / w.sum()
+    # (v5) a junction held only by zero-weight subjects has no weighted position; fall back to
+    # the plain mean so fused_xy stays finite. Every arc that touches it is dropped at 5.6.1.3.
+    w = (w / w.sum()) if w.sum() > 0 else np.full(len(w), 1.0 / max(len(w), 1))
     P = np.array([subj_nodes[sid][0][i] for sid, i in slot.items()], float)
     return (w[:, None] * P).sum(axis=0)
 
@@ -1264,8 +1388,21 @@ def _inject_line_phantom(R, s, tmpl, subj_arcs, params):
     # identity, never list.remove: Arc.__eq__ compares numpy arrays and raises on two arcs
     # that happen to share a code
     subj_arcs[s][:] = [a for a in subj_arcs[s] if a is not H]
+    # (v5) splitting the host must not lose the TEMPLATE junction ids at its OUTER ends: those
+    # two ends are still the same junctions they were before the cut. The new interior ends
+    # carry no id and cluster geometrically, which is correct -- the cut created them.
+    _hp = H.plabels if getattr(H, "plabels", None) else (None, None)
+    _new = []
     for p in pieces:
-        subj_arcs[s].append(Arc(tuple(int(c) for c in H.code), p, closed=False))
+        _a = Arc(tuple(int(c) for c in H.code), p, closed=False)
+        _new.append(_a); subj_arcs[s].append(_a)
+    if _new and (_hp[0] is not None or _hp[1] is not None):
+        # _split_polyline_at returns the pieces ORDERED along H, so piece 0 holds H's start
+        # and piece -1 holds H's end
+        _p = list(_new[0].plabels) if _new[0].plabels else [None, None]
+        _p[0] = _hp[0]; _new[0].plabels = tuple(_p)
+        _p = list(_new[-1].plabels) if _new[-1].plabels else [None, None]
+        _p[1] = _hp[1]; _new[-1].plabels = tuple(_p)
     f0, f1 = sorted(feet, key=lambda f: f[0])
     seg = np.vstack([np.asarray(f0[1], float), np.asarray(f1[1], float)])
     for a in tmpl["arcs"]:
@@ -1962,10 +2099,10 @@ def match_arcs(subj_arcs, node_map):
             groups.append((key, s))
     return groups
 
-def _blank_stat(support, dropped=False):
+def _blank_stat(support, dropped=False, unpaired=False):
     return {"support": support, "snap": 0.0, "saturated": 0, "n_anchors": 0, "kp_dropped": 0,
             "fit_residual": 0.0, "dir_gap": 1.0, "dropped": dropped, "n_pts": 0,
-            "len_F": 0.0, "len_blend": 0.0}
+            "len_F": 0.0, "len_blend": 0.0, "unpaired": unpaired}
 
 # 5.6  fuse one arc across subjects
 def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams, ref_sid):
@@ -2104,19 +2241,19 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
     # scratch on the second pass, so the throwaway first-pass indices do not leak.
     pre_xy, pre_regs = {}, {}
     for sid in sids:
-        xy0, regs0, _ = build_nodes(subj_arcs[sid], params)
+        xy0, regs0, _, _ = build_nodes(subj_arcs[sid], params)
         pre_xy[sid], pre_regs[sid] = xy0, regs0
     phantom_inserted, phantom_complex, phantom_independent = inject_phantom_regions(
         subj_arcs, pre_xy, pre_regs, seeds or [], params)
 
-    subj_nodes, subj_phantom = {}, {}
+    subj_nodes, subj_phantom, subj_label = {}, {}, {}
     for sid in sids:
-        xy, regs, phan = build_nodes(subj_arcs[sid], params)
-        subj_nodes[sid], subj_phantom[sid] = (xy, regs), phan
+        xy, regs, phan, lab = build_nodes(subj_arcs[sid], params)
+        subj_nodes[sid], subj_phantom[sid], subj_label[sid] = (xy, regs), phan, lab
 
     # ---- REFERENCE SUBJECT selection -- AFTER phantom injection so node counts are current ----
     # The reference is the arc/anchor orientation baseline (fuse_arc_group orders it first) and
-    # the fallback the orphan_policy='reference' uses. It is chosen PER SLICE by this ladder:
+    # the fallback the orphan_region_policy='reference' uses. It is chosen PER SLICE by this ladder:
     #   0. MANUAL override: params.reference_sid set to a real sid wins outright. (The TEST
     #      notebook exposes this as a per-slice toggle; None/'AUTO' -> the auto ladder below.)
     #   1. the subject with the MOST NODES after injection (only Situation-1 coverage moves this,
@@ -2140,7 +2277,8 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
               f"{[_acr(r, report_ctx) for r in phantom_independent[:8]]} carried through at "
               f"full geometry (Situation 1: no shared boundary to pin a phantom to).")
 
-    fused_xy, node_map, nstats = match_nodes(subj_nodes, weights, params, subj_phantom)
+    fused_xy, node_map, nstats = match_nodes(subj_nodes, weights, params, subj_phantom,
+                                             subj_label)
 
     n_multi = sum(1 for fi in range(len(fused_xy))
                   if sum(1 for s in node_map if fi in node_map[s].values()) > 1)
@@ -2220,17 +2358,84 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
     n_sub = len(sids)
     fused_arcs, astats = [], []
 
-    for key, group in groups:
-        if len(group) < n_sub:                          # ---- ORPHAN POLICY  [F4] --------
-            if params.orphan_policy == "drop":
+    # ---- 5.6.1.4 (v5)  ORPHAN REGION TEST  [F4] ---------------------------------------
+    # A group that only some subjects have is COVERAGE only when a whole REGION is missing
+    # from the others -- Situation 1 of 5.3.4.1, the case phantom injection deliberately
+    # leaves alone because there is no shared boundary to pin a phantom to. Every other
+    # partial group is a correspondence failure wearing coverage's clothes, and passing it
+    # through is what put two copies of the same boundary in the atlas.
+    #   5.6.1.4.1 presence : one of the arc's codes is a region the lacking subjects do not
+    #                        carry AT ALL
+    #   5.6.1.4.2 wholeness: the orphan arcs of that region are ALL of its arcs, so the
+    #                        absence really is the region and not a few arcs the matcher lost
+    #   5.6.1.4.3 refusal  : anything failing either test is a `fusion` failure for 5.9
+    _outer = int(params.outer_code)
+    _present_ids = {s: (_present_region_ids(subj_arcs[s]) - {_outer}) for s in sids}
+    _n_arcs_with = {s: defaultdict(int) for s in sids}
+    for s in sids:
+        for a in subj_arcs[s]:
+            for c in a.code:
+                if int(c) != _outer:
+                    _n_arcs_with[s][int(c)] += 1
+    _orphan_n, _partial = defaultdict(int), []
+    for gi, (key, group) in enumerate(groups):
+        if len(group) >= n_sub:
+            continue
+        _lack = [s for s in sids if s not in group]
+        _codes = {int(c) for c in key[0]} - {_outer}
+        # 5.6.1.4.1  a code absent from EVERY lacking subject
+        _absent = {c for c in _codes if all(c not in _present_ids[s] for s in _lack)}
+        _partial.append((gi, key, group, _lack, _absent))
+        for c in _absent:
+            _orphan_n[c] += 1
+    # 5.6.1.4.2  and the orphan arcs of that region must be ALL of its arcs
+    _whole = set()
+    for c, n_orph in _orphan_n.items():
+        _have = [s for s in sids if c in _present_ids[s]]
+        if _have and all(_n_arcs_with[s][c] == n_orph for s in _have):
+            _whole.add(c)
+    _orphan_ok = {gi for (gi, _k, _g, _l, _a) in _partial if _a & _whole}
+    orphan_failures = []
+    for (gi, key, group, _lack, _absent) in _partial:
+        if gi in _orphan_ok:
+            continue
+        # 5.6.1.4.3  say WHICH test failed, because the two mean different things
+        _why = ("every region on this arc is present in the subject(s) that lack the arc, so "
+                "the arc did not go missing with a region"
+                if not _absent else
+                "the region is absent here but only SOME of its arcs are unpaired, so the "
+                "absence is a matching failure rather than missing coverage")
+        orphan_failures.append(SliceFailure(
+            "fusion", "5.6.1.4",
+            f"arc supported by {sorted(group)} only, and it is not an orphan REGION: {_why}",
+            xy=tuple(float(v) for v in
+                     np.asarray(next(iter(group.values())).pts, float).mean(axis=0)),
+            code=tuple(int(c) for c in key[0]),
+            detail={"support": len(group), "lacking": sorted(_lack),
+                    "absent_codes": sorted(_absent)}))
+
+    for gi, (key, group) in enumerate(groups):
+        # 5.6.1.3 (v5) DEGENERATE WEIGHTS. The weighted Frechet mean of Definition 1 in
+        # Ginestet, Simmons & Kolaczyk (2012) gives a zero-weight element no influence on the
+        # minimiser, so an arc supported only by zero-weight subjects contributes nothing and
+        # is dropped. Without this, fuse_arc_group's per-group renormalisation (w / w.sum())
+        # would promote it back to weight 1 and break S7_sweep_identity by construction.
+        if sum(weights[s] for s in group) <= 0.0:
+            astats.append(_blank_stat(len(group), dropped=True))
+            continue
+        if len(group) < n_sub:                   # ---- ORPHAN REGION POLICY  [F4] --------
+            if gi not in _orphan_ok:                 # 5.6.1.4.3  refused, never passed through
+                astats.append(_blank_stat(len(group), dropped=True, unpaired=True))
+                continue
+            if params.orphan_region_policy == "drop":
                 astats.append(_blank_stat(len(group), dropped=True))
                 continue
-            if params.orphan_policy == "reference":
+            if params.orphan_region_policy == "reference":
                 if ref_sid not in group:
                     astats.append(_blank_stat(len(group), dropped=True))
                     continue
                 group = {ref_sid: group[ref_sid]}
-            elif len(group) < params.min_arc_support:
+            elif len(group) < params.min_region_support:
                 astats.append(_blank_stat(len(group), dropped=True))
                 continue
 
@@ -2242,7 +2447,7 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
     # node was never really attached to it. Every such arc on the slice is collected first.
     snap_max = float(params.snap_max_px if params.snap_max_px is not None
                      else params.node_match_max)
-    fuse_failures = []
+    fuse_failures = list(orphan_failures)          # 5.6.1.4.3  refused partial groups
     for arc, st in zip(fused_arcs, astats):
         if st.get("dropped") or float(st.get("snap", 0.0)) <= snap_max:
             continue
@@ -2717,7 +2922,7 @@ THRESHOLDS = {
     "S3_node_rejected_far":  ("==", 0),
     "S4_snap_dist_max_px":   ("<=", 1.0),
     "S4_arcs_dropped":       ("==", 0),
-    "S5_orphan_arcs":        ("==", 0),
+    "S5_faceless_arcs":      ("==", 0),   # (v5, was S5_orphan_arcs)
     "S5_rings_nonsimple":    ("==", 0),
     "S5_merged_regions":     ("==", 0),
     "S5_unlabeled_faces":    ("==", 0),
@@ -2827,7 +3032,8 @@ def diag_arcs(astats, n_subjects, params: FusionParams):
     return {"S4_n_fused_arcs": len(live),
             "S4_snap_dist_max_px": round(max(snaps), 3) if snaps else 0.0,
             "S4_arcs_dropped": sum(1 for s in astats if s.get("dropped")),
-            "S4_arcs_partial": sum(1 for s in live if s["support"] < n_subjects),
+            "S4_orphan_region_arcs": sum(1 for s in live if s["support"] < n_subjects),
+            "S4_unpaired_arcs": sum(1 for s in astats if s.get("unpaired")),
             "S4_dir_ambiguous": sum(1 for s in live if s["dir_gap"] < 0.05),
             "S4_support_hist": dict(sorted(
                 {k: sum(1 for s in live if s["support"] == k)
@@ -2837,16 +3043,18 @@ def diag_arcs(astats, n_subjects, params: FusionParams):
                                    if live else 0.0),
             "S4_kp_nonmonotone": sum(s["kp_dropped"] for s in live),
             "S4_pts_total": sum(s["n_pts"] for s in live),
-            "S4_orphan_policy": params.orphan_policy}
+            "S4_orphan_region_policy": params.orphan_region_policy}
 
 # ---- S5 rebuild ---------------------------------------------------------------------
 def diag_rebuild(rb, expected_ids, params: FusionParams):
-    """S5 rebuild stage: faces, orphan arcs, unlabeled ids and region yield. [5.8.1]"""
+    """S5 rebuild stage: faces, FACELESS arcs, unlabeled ids and region yield. [5.8.1]
+    A faceless arc bounds no polygon. It has nothing to do with the orphan REGIONS of
+    5.6.1.4; the two were both called "orphan" before v5."""
     regions, arcs, arc_faces = rb["regions"], rb["arcs"], rb["arc_faces"]
     flags, prep = rb["flags"], rb["report"]
     nonsimple = [rid for rid, fs in regions.items() for f in fs
                  if not LinearRing(f.exterior.coords).is_simple]
-    orphan = [i for i, c in enumerate(arc_faces) if c == 0]
+    faceless = [i for i, c in enumerate(arc_faces) if c == 0]
     got = set(regions) - {params.outer_code}
     exp = set(int(x) for x in expected_ids) - {params.outer_code}
     unlab = [f for f in flags if f[0] == "unlabeled"]
@@ -2856,8 +3064,8 @@ def diag_rebuild(rb, expected_ids, params: FusionParams):
             "S5_regions_extra": sorted(got - exp)[:12],
             "S5_unlabeled_faces": len(unlab),
             "S5_unlabeled_detail": unlab[:8],
-            "S5_orphan_arcs": len(orphan),
-            "S5_orphan_codes": [arcs[i].code for i in orphan[:8]],
+            "S5_faceless_arcs": len(faceless),
+            "S5_faceless_codes": [arcs[i].code for i in faceless[:8]],
             "S5_rings_nonsimple": len(nonsimple),
             "S5_nonsimple_ids": nonsimple[:8],
             "S5_merged_regions": sum(1 for f in flags if f[0] == "merged_regions"),
@@ -3119,7 +3327,7 @@ def diag_shape(regions, subj_regions, weights, astats, params: FusionParams):
 def print_report(d, title="fusion diagnostics", verbose=False):
     """Print the diagnostics dict grouped by stage. [5.8]"""
     HIDE = {"S2_dangling_coords", "S2_short_arc_codes", "S3_collision_sets", "S3_unmatched",
-            "S3_rejected_detail", "S5_orphan_codes", "S5_nonsimple_ids", "S5_regions_missing",
+            "S3_rejected_detail", "S5_faceless_codes", "S5_nonsimple_ids", "S5_regions_missing",
             "S5_regions_extra", "S5_unlabeled_detail", "S5_topo_delta_regions"}
     print(f"\n=== {title} ===")
     stage = None
@@ -3138,7 +3346,7 @@ def print_report(d, title="fusion diagnostics", verbose=False):
     if not verbose and bad:
         for k in sorted(bad):
             for det in (k.replace("_faces", "_detail"), k + "_detail",
-                        k.replace("S5_orphan_arcs", "S5_orphan_codes"),
+                        k.replace("S5_faceless_arcs", "S5_faceless_codes"),
                         k.replace("S3_node_rejected_far", "S3_rejected_detail")):
                 if det in d and d[det]:
                     print(f"     {det}: {d[det]}")
@@ -3166,26 +3374,50 @@ def _curve_dist(arcsA, arcsB, step=0.25):
     dB = np.min([[max_deviation(p[None], R) for R in LA] for p in PB], axis=1).max()
     return float(max(dA, dB))
 
-def sweep_identity(graphs, params: FusionParams = None, step=0.5):
+def sweep_identity(graphs, params: FusionParams = None, step=0.25):
     """S7_sweep_identity: all weight on subject i must return subject i's own map. [5.8.3]
-    Bound is fit_tol*3 + node_tol/2; needs no reference data."""
+
+    (v5) WHAT THIS TEST IS. Fusion is a weighted Frechet mean (Frechet 1948; Karcher 1977).
+    Ginestet, Simmons & Kolaczyk (2012) state it as a convex-combination operator,
+    a A (+)_r b B in arginf_y [ a d(A,y)^r + b d(y,B)^r ]   (their Definition 1),
+    and prove its algebraic properties in their Lemma 1. Setting b = 0 leaves
+    arginf_y a d(A,y)^r, whose minimiser is A itself: with all weight on one element the
+    weighted Frechet mean IS that element. So this is not an approximation that should come
+    out "close" -- it is an EXACT identity, and any deviation measures only the error the
+    implementation adds. Two consequences follow, and both are now enforced:
+
+      1. the run must use EXACT zero weights, not 1e-12. A zero-weight subject contributes
+         nothing to the functional, so fuse_graphs drops any arc only it supports (5.6.1.3);
+         the old 1e-12 fudge let per-group renormalisation promote such an arc back to full
+         weight, which made the test fail by construction under orphan_region_policy
+         ='passthrough'.
+      2. the bound must be the implementation's OWN error budget, not a free factor. There
+         are exactly two sources of deviation from the identity:
+             fit_tol_px  -- 5.6.6.1 resamples each arc to a sagitta bound of fit_tol_px, so
+                            the returned polyline may sit up to fit_tol_px off the input.
+             node_tol    -- 5.2.2.1 puts a junction at the CENTROID of its endpoint cluster
+                            and 5.6.8.1 snaps the arc end onto it, so an end may move by up
+                            to the cluster radius, which node_tol bounds.
+         bound = fit_tol_px + node_tol. The old fit_tol*3 + node_tol/2 had no derivation.
+    """
     params = params or FusionParams()
     sids = list(graphs)
-    bound = params.fit_tol_px * 3 + params.node_tol / 2
+    bound = params.fit_tol_px + params.node_tol      # 5.8.3  see the derivation above
     out = {}
     for i in sids:
-        w = {s: (1.0 if s == i else 0.0) for s in sids}
-        w[i] = 1.0
         p2 = FusionParams(**{**params.__dict__})
         p2.strict_topo = False                      # a one-hot run must not abort on topology
         p2.phantom_regions = False                  # nor inject phantoms (would perturb identity)
         p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
-        res = fuse_graphs(graphs, weights={s: (1.0 if s == i else 1e-12) for s in sids},
+        # exact 0.0: the degenerate case of Definition 1, not an approximation to it
+        res = fuse_graphs(graphs, weights={s: (1.0 if s == i else 0.0) for s in sids},
                           params=p2)
         out[i] = _curve_dist(res.arcs, graph_to_arcs(graphs[i]), step)
     worst = max(out.values()) if out else 0.0
     return {"S7_sweep_identity_px": round(worst, 4),
             "S7_sweep_identity_bound_px": round(bound, 4),
+            "S7_sweep_identity_bound_terms": {"fit_tol_px": params.fit_tol_px,
+                                              "node_tol": params.node_tol},
             "S7_sweep_identity_per_subject": {k: round(v, 4) for k, v in out.items()},
             "S7_sweep_identity_ok": bool(worst <= bound)}
 
@@ -3322,7 +3554,7 @@ def run_fusion(graphs, seeds, expected_ids, weights=None, params: FusionParams =
     if verbose:
         title = (f"slice {slice_index}: edge/node + SATM fusion "
                  f"({len(graphs)} subjects, {len(res.arcs)} arcs, {len(regions)} regions, "
-                 f"rep={params.representation}, orphan={params.orphan_policy}"
+                 f"rep={params.representation}, orphan={params.orphan_region_policy}"
                  f"{'' if params.run_comparative_diag else ', S6/S7 OFF'})")
         print_report(d, title, verbose=verbose_diag)
     node_graph = arcs_to_node_graph(res.arcs, verify=True)      # every vertex is a node now

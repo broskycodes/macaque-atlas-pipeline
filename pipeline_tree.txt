@@ -1,8 +1,19 @@
-MACAQUE MRI ATLAS -- PIPELINE TREE v4
+MACAQUE MRI ATLAS -- PIPELINE TREE v5
 Numbering is N.M.K. Every notebook cell header and function docstring cites the node it
 implements, so a node number is a search key across all four notebooks and edge_fusion.py.
 Comment markers [^cNN] are carried over unchanged from v2; the comment bodies are at the end.
-Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against v3.
+Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against v3; (v5)
+likewise against v4.
+
+v5 IN ONE PARAGRAPH. Junction identity used to be re-derived per subject, by clustering arc
+endpoints within node_tol. node_tol was 1.0 voxel, which is exactly the spacing of the
+half-integer lattice the trace puts junctions on, so a sub-voxel difference between two
+subjects flipped a merge and changed the topology. 3.1.3.5 now stamps a junction id ONCE on
+the template and 3.1.8 / 3.2.3.2 / 4.4.1 carry it, so 5.2.2.1 groups those ends by NAME and
+only what the reviewer drew is still clustered by distance. node_tol is 0.1. 5.6.1.4 admits a
+partially supported group as coverage only when a whole REGION is missing, which is what
+orphan_region_policy (was orphan_policy) is actually for. 6.1.1 mirrors about the cut plane,
+not H/2, and 6.1.2.1 is a hard gate. 3.1.10 is the audit that would have caught all of it.
 
 - 0 Setup
   - 0.1 Mount Drive and install dependencies
@@ -95,6 +106,19 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
       - 3.1.3.2 Walk slice and record when voxels change regions
       - 3.1.3.3 Each segment records the two regions it separates
       - 3.1.3.4 Merge segments with same region boundaries into polylines
+      - 3.1.3.5 (v5) JUNCTION IDENTITY. Once the template graph for a slice exists, every
+                junction node is given a stable integer id. A node is a junction when its
+                incident element count is not 2, or is 2 with different material pairs -- the
+                SAME predicate 5.2.2 uses to end an arc, so the two can never disagree. The
+                test reads element incidence and material codes only: there is no distance,
+                radius or tolerance in it, so two junctions one voxel apart and two junctions
+                a thousandth of a voxel apart are equally distinct. Ids are handed out in
+                sorted coordinate order, so the same graph always yields the same ids
+        - 3.1.3.5.1 (v5) The id is meaningful only because 3.1.7 gives every subject a COPY
+                of one template graph. Ids assigned independently per subject would be
+                unrelated numbers; 5.5.1.0.1 detects that case and discards them
+        - 3.1.3.5.2 (v5) The id is carried by 3.1.8 (a 4th field on each N line), by 3.2.3.2
+                (an optional _j<j0>_<j1> suffix on the arc's SVG id) and recovered by 4.4.1
     - 3.1.4 Smoothing and simplification
       - 3.1.4.1 Gaussian low-pass filter[^c10][^c11]
       - 3.1.4.2 Simplification via Douglas-Pecker algorithm
@@ -121,16 +145,49 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
       - 3.1.6.2 (v3) Seeds are used only to break island / donut face ambiguities (5.7.3.3)
     - 3.1.7 Template graph identically applied to every slice
     - 3.1.8 Written as ASCII line file
+      - 3.1.8.1 (v5) Each N line carries an optional 4th field, the 3.1.3.5 junction id
+                (-1 = not a junction). A file without it still reads, and yields a graph with
+                no junction ids at all
     - 3.1.9 (v3) Trace cache
       - 3.1.9.1 The trace is cached under a CACHE KEY of the label volume plus the trace
                 parameters (including trim_stage, trace_max_vertices, trace_force_vertices),
                 so changing any of them invalidates the cache instead of reusing it
+    - 3.1.10 (v5) TRACE AUDIT. Diagnostic only; produces no pipeline output. Gated on
+              AUDIT_REGION_COUNTS (0.4.4)
+      - 3.1.10.1 Stage-to-stage: a region or fragment lost or gained, or a node added or
+                deleted, between two consecutive checkpoints of ONE subject. Losses that
+                3.1.3.1 or 3.1.4.4 caused on purpose are passed in as expected_lost and
+                reported quietly; anything else is declared loudly
+      - 3.1.10.2 Subject-to-subject: the same checkpoint compared across subjects
+      - 3.1.10.3 (v5) JUNCTION CENSUS. 3.1.10.1/2 count VERTICES. Two subjects can carry
+                identical vertex and element counts while their JUNCTION sets differ, which
+                is the difference 5.5.1 fails on, so the junctions are censused separately:
+                arc count, junction count, how many junctions still carry a 3.1.3.5 id, how
+                many arc ends were absorbed by clustering, and the sorted multiset of
+                incident region sets -- the key 5.5.1.1 will match on
+      - 3.1.10.4 (v5) NODE_TOL MARGIN. The distance between the closest pair of distinct
+                junctions, reported against node_tol, with a warning below a factor of 2. The
+                trace puts junctions on a half-integer lattice, so this number is normally
+                1.0 px and node_tol must sit well under it
+      - 3.1.10.5 (v5) Subject-to-subject junction comparison: arc count, junction count,
+                absorbed ends, region-set multiset and the carried id set must all agree
+      - 3.1.10.6 (v5) FORCE_AUDIT_FOR_SLICES (0.4.8). 3.1.10.3 and 3.1.10.5 are per-slice and
+                far too loud for a whole volume, so in FULL they run only for the slices
+                listed there; 3.1.10.4 is one line per slice and always runs. TEST runs one
+                slice and always reports everything
+      - 3.1.10.7 (v5) Checkpoints: 1 post-3.1.2, 2 post-3.1.4.2, 3 post-3.1.4.4,
+                4 post-3.1.7 (per subject), 5 post-3.2.6 (the re-imported graph, which is the
+                object 5.1.2 actually receives)
+
   - 3.2 Export slices for correction
     - 3.2.1 Loads "warped"[^c14] T1 as underlay
     - 3.2.2 Re-masks label slice to chosen hemisphere[^c15]
     - 3.2.3 Write layered SVG
       - 3.2.3.1 Background (white + T1 raster)
       - 3.2.3.2 Boundaries (line vectors, emitted as junction-wise arcs)
+        - 3.2.3.2.1 (v5) The arc's id becomes bnd_A_B_k_j<j0>_<j1> when both ends carry a
+                3.1.3.5 junction id. id is the only attribute Illustrator keeps, so it is the
+                only channel junction identity can survive QA on
       - 3.2.3.3 Labels (annotations)
       - 3.2.3.4 (v3) Double-line export mode: each shared border is written as two
                 coincident paths, one per owning region, so an expert can drag either side
@@ -150,6 +207,11 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
   - 4.4 Import corrected lines
     - 4.4.1 (v3) Region codes are recovered from id="bnd_A_B_k", because Illustrator strips
             data-* attributes on save
+      - 4.4.1.1 (v5) The optional _j<j0>_<j1> suffix restores the 3.1.3.5 junction ids onto
+                the re-imported nodes. It is applied only when the element still has ONE
+                subpath: a path the reviewer split no longer has the two ends the ids were
+                written for. A coordinate claimed by two different ids is counted and
+                reported -- it means the reviewer welded two junctions together
     - 4.4.2 (v3) _xHH_ escape sequences in ids are un-escaped before parsing
     - 4.4.3 (v3) Ancestor transforms are composed down the SVG tree before flattening
     - 4.4.4 (v3) Bezier segments are flattened at flatten_px (must be <= fit_tol_px)
@@ -172,6 +234,17 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
     - 5.2.1 Normalize weights[^c20]
     - 5.2.2 Decompose per-slice graph into arcs[^c21] + nodes (first pass)
       - 5.2.2.1 Find arc endpoints within tolerance -> node junctions[^c22]
+        - 5.2.2.1.1 (v5) An end carrying a 3.1.3.5 junction id is grouped by that ID and never
+                by distance. Only ends with no id -- which after v5 means ends the REVIEWER
+                created -- are clustered geometrically at node_tol. Topology therefore cannot
+                change between subjects unless the reviewer changed it
+        - 5.2.2.1.2 (v5) node_tol is 0.1 voxel, not 1.0. It is a COINCIDENCE tolerance (an
+                Illustrator end that should touch but does not), never a feature scale: 1.0
+                equalled the spacing of the half-integer junction lattice, so the merge
+                decision sat on a knife edge and flipped between subjects
+        - 5.2.2.1.3 (v5) Two ends weld only if their arcs SHARE a region. A junction is where
+                regions meet, so two boundaries with no region in common cannot be one
+                junction however close they pass
       - 5.2.2.2 Record closed island loops (no nodes)
   - 5.3 Inject phantom regions
     - 5.3.1 Verify all subjects that HAVE region R agree on its neighbour set -> disagreement
@@ -245,6 +318,16 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
     - 5.4.3 Phantom regions loudly declared
   - 5.5 Node fusion
     - 5.5.1 Match node junctions across subjects
+      - 5.5.1.0 (v5) A junction that still carries its 3.1.3.5 id is paired by that id first.
+                The id is identical across subjects by construction, so it needs neither a key
+                nor a distance. An id carried by only SOME subjects means the reviewer removed
+                or replaced that junction in the others, and is reported exactly like a
+                region-set miss so 5.5.3 and 5.9 handle it unchanged
+        - 5.5.1.0.1 (v5) INTEGRITY. A few ids disagreeing on their incident regions is a
+                legitimate reviewer edit, and those ids alone fall back to 5.5.1.1. Wholesale
+                disagreement means the graphs were numbered independently rather than copied
+                from one template (3.1.3.5.1), so EVERY id is discarded and 5.5.1.1 takes over
+                completely, with a warning
       - 5.5.1.1 Match through incident region sets
       - 5.5.1.2 Collisions resolved by Hungarian assessment[^c25] within a set displacement
       - 5.5.1.3 Phantom node junctions exempt from displacement requirement
@@ -260,6 +343,28 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
       - 5.6.1.2 Starting with reference subject, pull other subjects' arcs and weights into
                 shared space
       - 5.6.1.3 Renormalize weights per-arc[^c29]
+        - 5.6.1.3.1 (v5) DEGENERATE WEIGHTS. A group supported only by zero-weight subjects
+                is dropped rather than renormalised. Under the weighted Frechet mean a
+                zero-weight element has no influence on the minimiser, so renormalising such
+                a group to weight 1 would contradict the definition -- and did, which is why
+                5.8.3 failed by construction under orphan_region_policy='passthrough'
+      - 5.6.1.4 (v5) ORPHAN REGION TEST [F4]. A group that only some subjects have is
+                COVERAGE only when a whole REGION is missing from the others -- Situation 1 of
+                5.3.4.1, the case phantom injection deliberately leaves alone because there is
+                no shared boundary to pin a phantom to. Every other partial group is a
+                correspondence failure wearing coverage's clothes, and passing it through is
+                what put two copies of the same boundary in the atlas
+        - 5.6.1.4.1 PRESENCE: at least one of the arc's two codes must be a region the lacking
+                subjects do not carry AT ALL
+        - 5.6.1.4.2 WHOLENESS: the orphan arcs attributed to that region must be ALL of its
+                arcs in every subject that has it, so the absence really is the region and not
+                a few arcs the matcher lost
+        - 5.6.1.4.3 REFUSAL: a group failing either test is a `fusion` failure (5.9.1.2), is
+                dropped rather than emitted, and names which of the two tests it failed
+        - 5.6.1.4.4 orphan_region_policy (v5, was orphan_policy) and min_region_support (v5,
+                was min_arc_support) then decide what happens to a group that PASSED: keep it
+                from the subjects that have it (passthrough), discard it (drop), or take the
+                reference subject's version (reference)
     - 5.6.2 Orient arcs per-subject to[^c30] establish point-wise correspondence
       - 5.6.2.1 For island regions -> resample all copies to a common point count, force
                 consistent winding (using signed area), and rotate (using FFT correlation)
@@ -342,7 +447,22 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
       - 5.8.2.4 M4 skeleton/hull ratio (metrics_skele)
       - 5.8.2.5 diag_ignore_unlabeled excludes 8001+ and 9001+ ids from S6/S7 only
     - 5.8.3 S7_sweep_identity: putting all weight on subject i must return that subject's own
-            map, within fit_tol*3 + node_tol/2
+            map
+      - 5.8.3.1 (v5) WHY IT IS EXACT. Fusion is a weighted Frechet mean (Frechet 1948;
+                Karcher 1977). In the convex-combination form of Ginestet, Simmons & Kolaczyk
+                (2012), Definition 1, a A (+)_r b B lies in arginf_y [a d(A,y)^r + b d(y,B)^r];
+                setting b = 0 leaves arginf_y a d(A,y)^r, whose minimiser is A. The identity is
+                algebraic, not approximate, so any deviation measures only what the
+                implementation adds
+      - 5.8.3.2 (v5) The run therefore uses EXACT zero weights, not 1e-12, and 5.6.1.3.1 drops
+                what the zero-weight subject alone supports
+      - 5.8.3.3 (v5) The bound is the implementation's own error budget and nothing else:
+                fit_tol_px (5.6.6.1 resamples to a sagitta bound of that size) + node_tol
+                (5.2.2.1 places a junction at its cluster centroid and 5.6.8.1 snaps the arc
+                end onto it). The old fit_tol*3 + node_tol/2 had no derivation
+      - 5.8.3.4 (v5) The number is only meaningful on a slice with no 5.6.1.4.3 refusals: a
+                refused arc leaves a hole, and the hole, not the averaging, is what the
+                distance then measures
     - 5.8.4 M8 weight sweep: fused output tracked across the weight simplex
     - 5.8.5 Reference-subject ladder is exercised by S7_sweep_identity, not assumed
   - 5.9 (v4) Post-QA reviewer round-trip   (FULL and TEST only; see 5.9.6)
@@ -350,7 +470,8 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
             been collected -- never on the first one noticed
       - 5.9.1.1 topological  (5.3): a region absence phantom injection cannot resolve
       - 5.9.1.2 fusion       (5.6.8.1): an arc end that cannot be attached to its fused node
-                within snap_max_px
+                within snap_max_px; and (v5) (5.6.1.4.3) a partially supported group that is
+                not an orphan REGION
       - 5.9.1.3 post-fusion  (5.7.1.3): a dangling end with no node inside dangle_repair_px
       - 5.9.1.4 polygonize   (5.7.2.4): polygonize failed noded AND un-noded
     - 5.9.2 A topological failure exports ONE SVG PER SUBJECT, in QA style on that subject's
@@ -378,6 +499,11 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
 - 6 Conversion to volumetric model[^c41]
   - 6.1 Mirror Hemisphere back for Bilateral Symmetry
     - 6.1.1 Reflect kept-hemisphere graph across the L-R midline
+      - 6.1.1.0 (v5) THE AXIS IS THE CUT PLANE, NOT H/2. 3.1.1 keeps rows 0..H/2-1, so the
+                trace lays the cut face on row H/2 - 0.5. Mirroring about H/2 reflected that
+                line to H/2 + 0.5: two lines one voxel apart where there should be one, and
+                the weld only closed them because MIRROR_WELD_TOL happened to exceed 0.5.
+                3.1.1 now returns the cut plane and 6.1.1 / 6.1.2 use it
       - 6.1.1.1 (v4) Arcs lying ENTIRELY on the midline are DELETED rather than reflected,
                 BEFORE arcs_to_graph, so polygonize sees no wall and produces one face
                 spanning both hemispheres. Only an arc whose every point is within
@@ -386,6 +512,10 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
                 survives
     - 6.1.2 Weld the reflection to the original at the midline
       - 6.1.2.1 Merge coincident nodes along the midline seam
+        - 6.1.2.1.1 (v5) HARD GATE. Zero shared seam nodes means the two halves are disjoint
+                graphs that merely touch: no face can close across the midline and every
+                midline arc is present twice. Nothing downstream recovers from it, so the run
+                stops instead of warning
       - 6.1.2.2 Drop duplicated midline arcs so that faces can merge across the center
     - 6.1.3 Rebuild full-brain faces from the welded graph[^c42]
     - 6.1.4 Ensure same region IDs on both hemispheres
@@ -469,3 +599,67 @@ Nodes marked (v3) are implemented but were absent from v2; (v4) likewise against
       - 6.6.6.1 Per-region VTK reusing the meshes conditioned at 6.5
       - 6.6.6.2 models.csv listing region id, name, colour and file
       - 6.6.6.3 Slicer loader script that reads models.csv and builds the scene
+
+## Comments
+
+[^c8] Shravan Saranyan: This is to ensure the left hemisphere regions remain closed
+[^c27] Shravan Saranyan: For TEST notebook, just have it be a toggle
+[^c28] Shravan Saranyan: The manual toggle can point to any subject or be set to AUTO
+[^c48] Neel Heblikar: Plotly can create and export 3D visualizations as standalone HTML files
+[^c14] Shravan Saranyan: What does warped mean??? Hopefully not deformed
+[^c15] Shravan Saranyan: Is this part of 3.1.1 solution?
+[^c0] Shravan Saranyan: Alternative to test: Automatic reorientation and N4 bias control
+[^c9] Shravan Saranyan: What is this threshold? Where can it be found and/or tuned?
+      -> MIN_REGION_VOXELS, set in 0.4.4 of every notebook. TRIM_STAGE (0.4.4) decides what
+         happens to a piece below it: "raster" (3.1.3.1) or "vector" (3.1.4.4).
+[^c1] Shravan Saranyan: Figure out how we actually reoriented the scans (this is just a guess)
+[^c2] Shravan Saranyan: Also, did we decide a canonical orientation. We should check what orientation the scans currently are.
+[^c20] Shravan Saranyan: What are weights????
+[^c33] Shravan Saranyan: This picks both clear bumps and clefts to keep as keypoints
+[^c21] Shravan Saranyan: Defined as continuous link of segments with same region IDs (one contiguous border)
+[^c23] Shravan Saranyan: Defined as continuous link of segments with same region IDs (one contiguous border)
+[^c29] Shravan Saranyan: This ensures averaging works even if not all subjects have a copy of the arc
+       -> (v5) With the caveat at 5.6.1.3.1: a group whose weights are all zero is dropped, not
+          renormalised, and 5.6.1.4 decides whether a partial group is admitted at all.
+[^c19] Shravan Saranyan: This needs to be updated when converting test notebook into full version
+[^c6] Shravan Saranyan: We need to find more sources supporting this approach
+[^c45] Neel Heblikar: Intersection over Union Score
+[^c39] Shravan Saranyan: Great problem to highlight
+[^c34] Shravan Saranyan: This needs a more in-depth dive for the paper
+[^c26] Shravan Saranyan: Are these two redundant if all cases are labeled as complex?
+       -> No. 5.5.3.1 is the phantom-injection verdict (5.3), 5.5.3.2/5.5.3.3 are node-matching
+          verdicts (5.5.1). As of v4 both feed the SAME collected failure list at 5.9.1.1.
+[^c5] Shravan Saranyan: Get rid of inverse transforms if there isn't a use for them after
+[^c40] Shravan Saranyan: region ID
+[^c12] Shravan Saranyan: For what reason? This was the solution to some problem
+[^c10] Shravan Saranyan: This needs to be explained in reasoning
+[^c11] Shravan Saranyan: We also need a reason for sigma < alpha and a source
+[^c41] Shravan Saranyan: To be filled out
+[^c7] Shravan Saranyan: Only changes grid
+[^c38] Shravan Saranyan: Add logic such that it displays just the arcs (before building polygons), within the atlas subdirectory
+[^c31] Shravan Saranyan: I need to understand what this diagnostic is exactly for...
+[^c18] Shravan Saranyan: Remember to add where node fusion actually happens
+[^c44] Neel Heblikar: stores values from -32,768 to 32,767, each point holds a 16-bit integer
+[^c4] Shravan Saranyan: Should I still try NMI or not needed?
+[^c32] Shravan Saranyan: Explain why this structure is the way it is
+[^c46] Neel Heblikar: Need to learn about what this is
+[^c47] Neel Heblikar: What constitutes a case table?
+[^c25] Shravan Saranyan: Definition under reasoning
+[^c43] Neel Heblikar: affine, to my understanding, is a 4x4 matrix stored on a nifti header that converts voxel indexes to 3d cartesian coordinates
+[^c13] Shravan Saranyan: See P&S for description
+[^c36] Shravan Saranyan: This is the actual averaging step
+[^c35] Shravan Saranyan: What problem would a blend solve against the other two?
+[^c3] Shravan Saranyan: Update when parameter list comes in
+[^c22] Shravan Saranyan: For now, node junctions are where 3+ regions meet
+       -> (v5) Implemented as the element-incidence predicate of 3.1.3.5, which is that rule
+          plus the corner-to-corner case (two regions meeting diagonally, where four same-code
+          edges meet at one lattice point). No distance is involved.
+[^c24] Shravan Saranyan: For now, node junctions are where 3+ regions meet
+[^c37] Shravan Saranyan: Avoids endpoints alone from being yanked
+[^c30] Shravan Saranyan: Subjects may have traced the arcs in either direction
+[^c16] Shravan Saranyan: I must determine the optimal topological rules, this will be the solution to a problem
+[^c17] Shravan Saranyan: May be the only solution to the problem of averaging topologically non-identical regions
+       -> (v5) 4.3.1 is now enforced structurally rather than by instruction: junction identity
+          is carried from the template (3.1.3.5), so the graphs stay topologically identical
+          unless the reviewer deliberately changes them, and 5.5.1.0 / 5.6.1.4 name exactly
+          what changed when they do.

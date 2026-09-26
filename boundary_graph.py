@@ -27,6 +27,10 @@ class BoundaryGraph:
     nodes: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))   # (Nx2) xy
     # elements: list of [node_i, node_j, matA, matB]; mat codes -1 == unknown
     elements: list = field(default_factory=list)
+    # 3.1.3.5 (v5) junctions: per-node junction id, -1 = not a junction, None = not computed.
+    # Stamped ONCE on the template by mark_junctions() and carried to every subject, so a
+    # junction is an identity the pipeline transports rather than a tolerance it re-infers.
+    junctions: np.ndarray = None
 
     _grid: dict = field(default_factory=dict, repr=False, compare=False)
     _pts:  list = field(default_factory=list, repr=False, compare=False)
@@ -71,6 +75,13 @@ class BoundaryGraph:
             return
         self.elements.append([i, j, matA, matB])
 
+    def junction_id(self, n):
+        """Junction id of node n, or -1 when n is not a junction / none computed. [3.1.3.5]"""
+        J = self.junctions
+        if J is None or n >= len(J):
+            return -1
+        return int(J[n])
+
     def node_degree(self):
         deg = np.zeros(len(self.nodes), int)
         for e in self.elements:
@@ -92,6 +103,41 @@ def cubic_spline_to_polyline(coeffs, t_values=(0.0, 0.25, 0.75, 1.0)):
         y = ay*t**3 + by*t**2 + cy*t + dy
         pts.append((x, y))
     return np.array(pts)
+
+
+# 3.1.3.5 (v5)  stamp a stable id on every junction node of a graph
+def _element_code(e):
+    """Ordered material pair of one element. [3.1.3.5]"""
+    a, b = int(e[2]), int(e[3])
+    return (min(a, b), max(a, b))
+
+
+def mark_junctions(g):
+    """Give every JUNCTION node of `g` a stable integer id, written to g.junctions. [3.1.3.5]
+
+    A node is a junction when its incident element count is not 2, or is 2 with different
+    material pairs -- the SAME predicate edge_fusion.graph_to_arcs uses to end an arc, so the
+    two can never disagree. The test is on element incidence and material codes only: there is
+    no distance, radius or tolerance anywhere in it, so two junctions one voxel apart, or a
+    thousandth of a voxel apart, are two different nodes and get two different ids.
+
+    Ids are handed out in sorted coordinate order so the same graph always yields the same ids.
+    """
+    inc = {}
+    for ei, e in enumerate(g.elements):
+        inc.setdefault(int(e[0]), []).append(ei)
+        inc.setdefault(int(e[1]), []).append(ei)
+    hits = []
+    for n, eis in inc.items():
+        if len(eis) != 2 or _element_code(g.elements[eis[0]]) != _element_code(g.elements[eis[1]]):
+            hits.append(int(n))
+    nodes = np.asarray(g.nodes, float)
+    hits.sort(key=lambda n: (round(float(nodes[n][0]), 6), round(float(nodes[n][1]), 6), n))
+    J = np.full(len(nodes), -1, dtype=np.int64)
+    for k, n in enumerate(hits):
+        J[n] = k
+    g.junctions = J
+    return g
 
 
 # 3.1.3.4  polylines into a graph, merging coincident endpoints
@@ -422,11 +468,15 @@ def mirror_across_midline(g, axis_x):
 
 # 3.1.8  ASCII line file: nodes, then elements
 def write_ascii(g, path):
-    """Kulkarni 3.2.5 output format: nodes (id x y) then elements (n_i n_j matA matB)."""
+    """Kulkarni 3.2.5 output format: nodes (id x y [junction_id]) then elements
+    (n_i n_j matA matB). The 4th N field is the v5 junction id; it is written only when the
+    graph carries one, so older files still read."""
+    J = g.junctions
     with open(path, "w") as f:
         f.write(f"# NODES {len(g.nodes)}\n")
         for i, (x, y) in enumerate(g.nodes):
-            f.write(f"N {i} {x:.6f} {y:.6f}\n")
+            j = "" if J is None or i >= len(J) else f" {int(J[i])}"
+            f.write(f"N {i} {x:.6f} {y:.6f}{j}\n")
         f.write(f"# ELEMENTS {len(g.elements)}\n")
         for k, e in enumerate(g.elements):
             f.write(f"E {k} {e[0]} {e[1]} {e[2]} {e[3]}\n")
@@ -436,7 +486,7 @@ def write_ascii(g, path):
 # 5.1.2  read a boundary graph back from the ASCII line file
 def read_ascii(path):
     g = BoundaryGraph()
-    nodes = []
+    nodes, jids, any_j = [], [], False
     with open(path) as f:
         for line in f:
             t = line.split()
@@ -444,9 +494,14 @@ def read_ascii(path):
                 continue
             if t[0] == "N":
                 nodes.append((float(t[2]), float(t[3])))
+                if len(t) > 4:                      # v5 junction id
+                    jids.append(int(t[4])); any_j = True
+                else:
+                    jids.append(-1)
             elif t[0] == "E":
                 g.elements.append([int(t[2]), int(t[3]), int(t[4]), int(t[5])])
     g.nodes = np.array(nodes) if nodes else np.zeros((0, 2))
+    g.junctions = np.asarray(jids, dtype=np.int64) if any_j else None
     return g
 
 
