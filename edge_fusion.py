@@ -78,7 +78,9 @@ except Exception:                                    # pragma: no cover
     _HAVE_SPLINE = False
 
 # =====================================================================================
-# Failure model  [5.9]   -- the four stages where the pipeline can break down
+# 0a.  FAILURE MODEL   [5.9]   -- the four stages where the pipeline can break down
+# OUT OF TREE ORDER ON PURPOSE: these exception classes are raised by every section
+# below and TopologyDivergence subclasses FusionHalt, so they have to exist first.
 # =====================================================================================
 # 5.3      topological : a region absence that phantom injection cannot resolve
 # 5.6.8.1  fusion      : an arc end that cannot be attached to its fused node in tolerance
@@ -143,7 +145,7 @@ class _StageTimer:
         return False
 
 # =====================================================================================
-# Parameters   (AFAM Part II.  Units are VOXELS; 1 voxel == 1 SVG px in this pipeline.)   [5.1.1]
+# 0b.  PARAMETERS   [5.1.1]   (AFAM Part II. Units are VOXELS; 1 voxel == 1 SVG px.)
 # =====================================================================================
 @dataclass
 class FusionParams:
@@ -316,7 +318,7 @@ class FusionParams:
             raise ValueError(f"loop_align must be fft|coarse, got {self.loop_align!r}")
 
 # =====================================================================================
-# Data model   [5.2.2]
+# 0c.  DATA MODEL   [5.2.2]
 # =====================================================================================
 @dataclass(eq=False)     # identity equality: the fields include numpy arrays, and dataclass
                          # __eq__ on two arcs sharing a code raises instead of returning False
@@ -339,7 +341,7 @@ class Arc:
         return float(np.hypot(*np.diff(P, axis=0).T).sum())
 
 # =====================================================================================
-# 0b.  FRAGMENT IDENTITY -- one unique code per connected piece of a region   [3.1.2, 5.1.3.2]
+# 1.  FRAGMENT IDENTITY -- one unique code per connected piece of a region   [3.1.2, 5.1.3.2]
 # =====================================================================================
 # A region id may cover several disconnected pieces ("fragments"). Codes are made unique
 # at the SOURCE (raster relabelling before tracing): largest piece keeps the base id,
@@ -521,7 +523,7 @@ def registry_base_status(reg, slice_index):
     return out
 
 # =====================================================================================
-# 0c.  SUB-THRESHOLD REGION TRIMMING                                  [3.1.3.1 / 3.1.4.4]
+# 2.  SUB-THRESHOLD REGION TRIMMING   [3.1.3.1 / 3.1.4.4]
 # =====================================================================================
 # A region below the voxel threshold used to be set to background, which punched a HOLE in the
 # parcellation: the hole then has to be labelled by something downstream, and "background in
@@ -536,17 +538,11 @@ def registry_base_status(reg, slice_index):
 #
 # Both are area-partition simplification in the sense of van Oosterom's GAP-tree (1995): a
 # region too small to keep is not deleted, it is MERGED into a neighbour chosen by a
-# compatibility rule.
-#   "raster" uses the largest-shared-boundary rule. That is the GAP-tree's own collapse
-#   function Collapse(a, b) = f(L(a, b), CompatibleTypes(a, b), weight_factor(b)) with the type
-#   and weight terms dropped: brain regions carry no feature-classification hierarchy to
-#   compute compatibility from, so only the common-boundary length L(a, b) remains. Cheng & Li
-#   (2006) list the same longest-shared-boundary rule as one of three merge choices.
-#   "vector" dissolves the doomed polygon onto its own centre line and hands the halves to the
-#   flanking neighbours, rather than giving the whole polygon to one of them. That is the
-#   area collapse of Haunert & Sester (2008) and the skeleton-based GAP-tree extension of
-#   Ai & van Oosterom (2002); SPLITAREA (Meijers, Savino & van Oosterom 2016) is its weighted
-#   form, which this pipeline does not need because the halves are split evenly.
+# compatibility rule. "raster" uses the largest-shared-boundary rule, which is the collapse
+# criterion Cheng & Li (2006) and Haunert & Sester (2008) both use for area aggregation.
+# "vector" is the SPLITAREA idea of Ai & van Oosterom (2002): dissolve the doomed polygon onto
+# its own centre line and hand the halves to the flanking neighbours, rather than giving the
+# whole polygon to one of them.
 
 # 3.1.3.1  TRIM_STAGE="raster": absorb a sub-threshold piece into its largest-boundary neighbour
 def absorb_small_regions(label_slice, min_voxels, background=0, max_passes=8):
@@ -588,17 +584,14 @@ def absorb_small_regions(label_slice, min_voxels, background=0, max_passes=8):
     return lab, notes
 
 # 3.1.4.4  TRIM_STAGE="vector": approximate medial axis of the doomed polygon
-# NOTE ON METHOD: a STRAIGHT SKELETON is the object Haunert & Sester (2008) collapse areas onto,
-# but computing one exactly needs a CGAL binding (skgeom), which is not a dependency of this
-# pipeline. What is computed instead is the APPROXIMATE MEDIAL AXIS (Lee 1982): the interior
-# edges of the Voronoi diagram of the densely sampled boundary. Brandt & Algazi (1992) derive
-# this construction for a binary image shape and bound its error by the boundary sampling
-# density, which is what TRIM_VECTOR_SAMPLE_PX sets; Brandt (1994) gives the convergence
-# criteria. Amenta, Bern & Eppstein (1998) state the sampling requirement in terms of local
-# feature size. Everything below says "medial axis", never "skeleton", because that is what it
-# is. On a sub-threshold sliver the two objects differ by far less than one voxel, so the
-# distinction is one of naming rather than result -- but if skgeom is ever added,
-# _medial_axis_graph is the single function to swap out.
+# NOTE ON METHOD: a STRAIGHT SKELETON is the textbook object here, but computing one exactly
+# needs a CGAL binding (skgeom), which is not a dependency of this pipeline. What is computed
+# instead is the APPROXIMATE MEDIAL AXIS: the interior edges of the Voronoi diagram of the
+# densely sampled boundary, which converge to the medial axis as the sampling tightens
+# (Brandt & Algazi 1992; Amenta, Bern & Eppstein 1998). Everything below says "medial axis",
+# never "skeleton", because that is what it is. On a sub-threshold sliver the two objects
+# differ by far less than one voxel, so the distinction is one of naming rather than result --
+# but if skgeom is ever added, _medial_axis_graph is the single function to swap out.
 def _medial_axis_graph(ring, sample_px=0.5):
     """Interior Voronoi graph of a closed ring. Returns (V, edges) in ring coordinates,
     or (None, None) when the polygon is too small or degenerate to sample. [3.1.4.4]"""
@@ -768,344 +761,7 @@ def trim_small_regions_vector(arcs, small_codes, sample_px=0.5, background=0):
     return arcs, done, failed
 
 # =====================================================================================
-# 6.1.1  MIDLINE ARCS: delete rather than reflect
-# =====================================================================================
-def drop_midline_arcs(arcs, midline_lr, tol, outer_code=0):
-    """Remove arcs that lie ENTIRELY on the L-R midline, before the graph is rebuilt. [6.1.1]
-    Reflecting such an arc puts a wall down the centre of the brain, and polygonize then emits
-    two half-faces instead of one face spanning both hemispheres. Only an arc whose every point
-    is within `tol` of the midline AND whose non-background code is a real region is dropped,
-    so a genuine near-midline boundary between two DIFFERENT regions survives.
-    Returns (kept arcs, [(code, n_points), ...] dropped)."""
-    keep, dropped = [], []
-    out = int(outer_code)
-    for a in arcs:
-        P = np.asarray(a.pts, float)
-        on_midline = bool(np.all(np.abs(P[:, 1] - float(midline_lr)) <= float(tol)))
-        codes = [int(c) for c in a.code]
-        real = [c for c in codes if c != out]
-        # one real region against background, lying flat on the midline = the cut face
-        if on_midline and len(real) == 1 and out in codes:
-            dropped.append((tuple(codes), int(len(P))))
-            continue
-        keep.append(a)
-    return keep, dropped
-
-# =====================================================================================
-# 1.  Curvature, arc length, curvature-adaptive sampling                          [F1a]
-#    [5.6.3, 5.6.6.1]
-# =====================================================================================
-def arclength(P, closed=False):
-    """Cumulative arc length along P, one value per vertex. [5.6.3]"""
-    Q = np.vstack([P, P[0]]) if closed else np.asarray(P, float)
-    return np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(Q, axis=0).T))])
-
-def _dedup(P, eps=1e-12):
-    P = np.asarray(P, float)
-    if len(P) < 2:
-        return P
-    keep = np.r_[True, (np.abs(np.diff(P, axis=0)) > eps).any(axis=1)]
-    return P[keep]
-
-def densify(P, spacing, closed=False):
-    """Throwaway dense working copy at uniform arc-length spacing. [5.6.3]"""
-    P = _dedup(P)
-    if len(P) < 2:
-        return P
-    Q = np.vstack([P, P[0]]) if closed else P
-    s = arclength(Q)
-    if s[-1] <= 0:
-        return P
-    n = max(2, int(math.ceil(s[-1] / max(spacing, 1e-9))) + 1)
-    t = np.linspace(0.0, s[-1], n)
-    return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
-
-# 5.6.3  curvature per point along an arc polyline
-def curvature(P, sigma_px=1.0, spacing=None, closed=False):
-    """Discrete SIGNED curvature AT A SCALE; P must be arc-length parameterised. [5.6.3]
-    x(s) and y(s) are Gaussian-smoothed at sigma_px before differentiating, without which a
-    finely flattened polyline over-reports |kappa| by ~27x."""
-    P = np.asarray(P, float)
-    if len(P) < 5:
-        return np.zeros(len(P))
-    if spacing is None:
-        s = arclength(P, closed)
-        spacing = max(s[-1] / max(len(P) - 1, 1), 1e-9)
-    sig = max(sigma_px / max(spacing, 1e-9), 0.6)
-    mode = "wrap" if closed else "nearest"
-    X = gaussian_filter1d(P[:, 0], sig, mode=mode)
-    Y = gaussian_filter1d(P[:, 1], sig, mode=mode)
-    Q = np.column_stack([X, Y])
-    d1 = np.gradient(Q, axis=0)
-    d2 = np.gradient(d1, axis=0)
-    num = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
-    den = (d1[:, 0] ** 2 + d1[:, 1] ** 2) ** 1.5 + 1e-12
-    return num / den
-
-# 5.6.6.1.1  sagitta (max chord deviation) between a polyline and its resampling
-def max_deviation(P, R):
-    """Max distance from the vertices of P to the polyline R. [5.6.6.1.1]"""
-    P = np.asarray(P, float); R = np.asarray(R, float)
-    if len(R) < 2 or len(P) == 0:
-        return 0.0
-    A, B = R[:-1], R[1:]
-    AB = B - A
-    L2 = (AB ** 2).sum(1) + 1e-12
-    AP = P[:, None, :] - A[None]
-    t = np.clip((AP * AB[None]).sum(2) / L2[None], 0.0, 1.0)
-    proj = A[None] + t[..., None] * AB[None]
-    d = np.linalg.norm(P[:, None, :] - proj, axis=2)
-    return float(d.min(axis=1).max())
-
-# 5.6.6.1  grow the sample count until the sagitta bound is met (5.6.6.1.3 returns the max across subjects)
-def segment_budget(sub_arcs, tol_px, n_min, n_max, sigma_px, spacing, lam=0.5):
-    """F1a sagitta bound: chords needed to stay within tol_px of the true arc. [5.6.6.1.1]
-    m = ceil(L / sqrt(8 * tol * r)), clamped to [n_min_seg, n_max_seg]; hitting the clamp is
-    reported as S7_budget_saturated."""
-    n = n_min
-    for P in sub_arcs:
-        P = _dedup(P)
-        if len(P) < 2:
-            continue
-        L = float(arclength(P)[-1])
-        if L <= 0:
-            continue
-        k = np.abs(curvature(P, sigma_px, spacing))
-        kmax = float(k.max()) if len(k) else 0.0
-        m = 2 if kmax < 1e-9 else int(math.ceil(L / math.sqrt(8.0 * tol_px * (1.0 / kmax))))
-        m = int(np.clip(m, n_min, n_max))
-        while m < n_max:                                # verify, then grow
-            R = resample_by_curvature(P, m, lam, sigma_px, spacing, abs_k=k)  # reuse k (same P)
-            if max_deviation(P, R) <= tol_px:
-                break
-            m = min(n_max, int(m * 1.6) + 1)
-        n = max(n, m)
-    return int(np.clip(n, n_min, n_max))
-
-# 5.6.6.2  place points by arc length (lam=0), curvature (lam=1) or a blend
-def resample_by_curvature(P, n, lam=0.5, sigma_px=1.0, spacing=None, closed=False, abs_k=None):
-    """F1a reparameterisation, sampling s' uniformly. [5.6.6.2]
-    s' = (1-lam)*arclength + lam*cumulative|curvature|."""
-    P = _dedup(P)
-    if len(P) == 0:
-        return np.zeros((n, 2))
-    if len(P) < 2:
-        return np.repeat(P[:1], n, axis=0)
-    Q = np.vstack([P, P[0]]) if closed else P
-    s = arclength(Q)
-    if s[-1] <= 0:
-        return np.repeat(Q[:1], n, axis=0)
-    # abs_k: |curvature| for THESE points, if the caller already computed it (segment_budget does).
-    # Valid only when it matches Q's length; otherwise recompute. Saves a gaussian_filter1d + two
-    # np.gradient passes per resample, which the verify-and-grow loop calls repeatedly.
-    if abs_k is not None and len(abs_k) == len(Q):
-        k = abs_k
-    else:
-        k = np.abs(curvature(Q, sigma_px, spacing, closed))
-    ck = np.concatenate([[0.0], np.cumsum(k[:-1] * np.diff(s))])
-    if lam <= 0 or ck[-1] < 1e-9:                       # <- the guard
-        u = s / s[-1]
-    else:
-        u = (1 - lam) * s / s[-1] + lam * ck / ck[-1]
-    u = np.maximum.accumulate(u)
-    u = u + np.linspace(0.0, 1e-9, len(u))              # strict monotonicity for np.interp
-    u = (u - u[0]) / max(u[-1] - u[0], 1e-12)
-    t = np.linspace(0.0, 1.0, n)
-    return np.column_stack([np.interp(t, u, Q[:, 0]), np.interp(t, u, Q[:, 1])])
-
-def resample_open(pts, n):
-    """Resample an open polyline to n points, evenly by arc length. [5.6.6.2]"""
-    P = _dedup(pts)
-    if len(P) < 2:
-        return np.repeat(np.asarray(pts, float)[:1], n, axis=0)
-    s = arclength(P)
-    if s[-1] <= 0:
-        return np.repeat(P[:1], n, axis=0)
-    t = np.linspace(0.0, s[-1], n)
-    return np.column_stack([np.interp(t, s, P[:, 0]), np.interp(t, s, P[:, 1])])
-
-def resample_closed(pts, n):
-    """Resample a closed contour to n points, evenly by arc length. [5.6.6.2]"""
-    P = _dedup(pts)
-    if len(P) < 2:
-        return np.repeat(np.asarray(pts, float)[:1], n, axis=0)
-    Q = np.vstack([P, P[0]]) if np.hypot(*(P[0] - P[-1])) > 1e-12 else P
-    s = arclength(Q)
-    if s[-1] <= 0:
-        return np.repeat(Q[:1], n, axis=0)
-    t = np.linspace(0.0, s[-1], n, endpoint=False)
-    return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
-
-def signed_area(P):
-    """Shoelace area of a closed contour; the sign gives its winding. [5.6.2.1]"""
-    x, y = P[:, 0], P[:, 1]
-    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-
-# =====================================================================================
-# 2.  Arc representation: polyline (F1a) or spline (F1b), behind one interface   [5.6.3.1]
-# =====================================================================================
-# 5.6.3.1 / 5.6.3.2  ArcRep wrapper holding the dense working copy of one arc
-class ArcRep:
-    """A curve that can be EVALUATED at any fractional position u in [0,1], and whose curvature can
-    be asked for at those positions. [5.6.3.1]"""
-
-    def __init__(self, P, params: FusionParams, closed=False):
-        self.closed = closed
-        self.params = params
-        P = _dedup(P)
-        if closed and len(P) > 2 and np.hypot(*(P[0] - P[-1])) < 1e-12:
-            P = P[:-1]
-        self.raw = P
-        self.fit_residual = 0.0
-        self.dense = densify(P, params.curv_sample_px, closed)
-        self._D = np.vstack([self.dense, self.dense[0]]) if closed else self.dense
-        s = arclength(self._D)
-        self._u = s / max(s[-1], 1e-12)
-        self._len = float(s[-1])
-        self._k = None
-
-    # -- evaluation -------------------------------------------------------------------
-    def eval(self, u):
-        u = np.atleast_1d(np.asarray(u, float))
-        return np.column_stack([np.interp(u, self._u, self._D[:, 0]),
-                                np.interp(u, self._u, self._D[:, 1])])
-
-    def curvature_at(self, u):
-        u = np.atleast_1d(np.asarray(u, float))
-        if self._k is None:
-            self._k = curvature(self._D, self.params.curv_sigma_px,
-                                self.params.curv_sample_px, self.closed)
-        return np.interp(u, self._u, self._k)
-
-    def length(self):
-        return self._len
-
-    def sub_raw(self, u0, u1, m=64):
-        """The piece between u0 and u1 as a dense polyline (used for the sagitta budget)."""
-        m = max(m, int(abs(u1 - u0) * len(self._D)) + 2)
-        return self.eval(np.linspace(u0, u1, m))
-
-    def sub(self, u0, u1, n, lam):
-        """The piece between u0 and u1, resampled to n points with F1a's curvature reparam.
-        On the spline path the segment is fit as a cubic spline with anchor endpoints, so
-        corners survive."""
-        P = self.sub_raw(u0, u1, 4 * max(n, 8))
-        if self.params.representation == "spline" and len(P) >= 5:
-            try:
-                tck, _u = splprep([P[:, 0], P[:, 1]], s=self.params.spline_smooth, k=3)
-                t = np.linspace(0.0, 1.0, max(8 * n, 64))
-                x, y = splev(t, tck)
-                E = np.column_stack([x, y])
-                self.fit_residual = max(self.fit_residual,
-                                        float(cKDTree(E).query(P)[0].max()))   # -> S7_fit_residual
-                P = E
-            except Exception as e:                                             # never crash
-                warnings.warn(f"spline fit failed on a segment ({e}); using the polyline")
-        return resample_by_curvature(P, n, lam, self.params.curv_sigma_px,
-                                     self.params.curv_sample_px)
-
-# =====================================================================================
-# 3.  Key points (SATM Step 1) and their matching (SATM Step 2)                   [F1]   [5.6.4]
-# =====================================================================================
-# 5.6.4.1 / 5.6.4.1.1  local maxima of |curvature| above the floor, within a spacing
-def edge_keypoints(rep: ArcRep, params: FusionParams):
-    """Local |curvature| maxima, at least kp_alpha apart, above kp_curv_thresh. [5.6.4.1]
-    Returns fractional positions u in (0,1), sorted."""
-    if not params.keypoints:
-        return []
-    L = rep.length()
-    if L < 2 * params.kp_alpha:
-        return []                                       # too short to hold an interior anchor
-    n = max(32, int(L / max(params.curv_sample_px, 1e-6)))
-    u = np.linspace(0.0, 1.0, n)
-    a = np.abs(rep.curvature_at(u))
-
-    interior = np.arange(1, n - 1)
-    loc = interior[(a[1:-1] >= a[:-2]) & (a[1:-1] >= a[2:])]
-    cand = [int(i) for i in loc if a[i] >= params.kp_curv_thresh]
-
-    margin = params.kp_alpha / L                        # keep key points off the node anchors
-    keep = []
-    for i in sorted(cand, key=lambda j: -a[j]):         # strongest first: SATM's greedy alpha rule
-        if u[i] < margin or u[i] > 1.0 - margin:
-            continue
-        if all(abs(u[i] - u[j]) * L >= params.kp_alpha for j in keep):
-            keep.append(i)
-    return sorted(float(u[i]) for i in keep)
-
-# 5.6.4.2  benefit matrix (5.6.4.2.1) solved by the Hungarian algorithm (5.6.4.2.2)
-def match_keypoints(repA, uA, repB, uB, params: FusionParams, l_scale=None):
-    """SATM Step 2, applied per arc. [5.6.4.2]
-    Returns [(uA_k, uB_r), ...], sorted, strictly monotone in BOTH arcs."""
-    if not uA or not uB:
-        return [], 0
-    if l_scale is None:
-        l_scale = params.kp_l_scale
-    if l_scale is None:
-        l_scale = 0.5 * (repA.length() + repB.length())
-
-    PA, PB = repA.eval(np.array(uA)), repB.eval(np.array(uB))
-    g = params.kp_gamma * float(l_scale)
-    A3 = np.column_stack([PA, g * np.asarray(uA, float)])
-    B3 = np.column_stack([PB, g * np.asarray(uB, float)])
-
-    D = np.linalg.norm(A3[:, None, :] - B3[None, :, :], axis=2)
-    M, R = len(uA), len(uB)
-    Ben = np.zeros((M + R, M + R))
-    Ben[:M, :R] = np.maximum(0.0, params.kp_dmax - D)   # SATM's benefit matrix, zero-padded
-    r, c = linear_sum_assignment(-Ben)
-
-    pairs = sorted((uA[i], uB[j]) for i, j in zip(r, c)
-                   if i < M and j < R and Ben[i, j] > 0.0)
-    out, crossed = [], 0
-    for ua, ub in pairs:                                # a crossing match would invert a segment
-        if out and (ua <= out[-1][0] or ub <= out[-1][1]):
-            crossed += 1
-            continue
-        out.append((ua, ub))
-    return out, crossed
-
-# 5.6.4.3 / 5.6.5  anchors with 2+ matches are kept; a missing subject is interpolated (5.6.4.3.2)
-def anchor_table(reps, ref, params: FusionParams):
-    """N-subject generalisation of SATM's pairwise key-point matching. [5.6.4.3]
-    Returns ({sid: [0.0, ..., 1.0]}, n_anchors, n_dropped), same length for every subject; an
-    anchor non-monotone in any subject is dropped (S7_kp_nonmonotone)."""
-    sids = list(reps)
-    uref = edge_keypoints(reps[ref], params)
-    if not uref or len(sids) == 1:
-        return {s: [0.0, 1.0] for s in sids}, 0, 0
-
-    matched = {ref: {u: u for u in uref}}
-    dropped = 0
-    for s in sids:
-        if s == ref:
-            continue
-        us = edge_keypoints(reps[s], params)
-        pairs, crossed = match_keypoints(reps[ref], uref, reps[s], us, params)
-        dropped += crossed
-        matched[s] = dict(pairs)
-
-    keep = [u for u in uref if sum(1 for s in sids if u in matched[s]) >= 2]
-    if not keep:
-        return {s: [0.0, 1.0] for s in sids}, 0, dropped
-
-    table = {}
-    for s in sids:
-        m = matched[s]
-        ku = [0.0] + [u for u in keep if u in m] + [1.0]
-        kv = [0.0] + [m[u] for u in keep if u in m] + [1.0]
-        table[s] = [0.0] + [float(np.interp(u, ku, kv)) for u in keep] + [1.0]
-
-    ok = [i for i in range(1, len(keep) + 1)
-          if all(table[s][i] > table[s][i - 1] + 1e-6 and table[s][i] < table[s][i + 1] - 1e-6
-                 for s in sids)]
-    dropped += len(keep) - len(ok)
-    for s in sids:
-        table[s] = [0.0] + [table[s][i] for i in ok] + [1.0]
-    return table, len(ok), dropped
-
-# =====================================================================================
-# 4.  Graph <-> arcs   [5.2.2, 5.6.7]
+# 3.  GRAPH <-> ARCS   [5.2.2, 5.6.7]
 # =====================================================================================
 def _code_of(e):
     a, b = int(e[2]), int(e[3])
@@ -1235,8 +891,7 @@ def arcs_to_node_graph(arcs, weld=1e-9, verify=True):
     return g
 
 # =====================================================================================
-# 5.  Nodes: cluster within a subject, then match across subjects            [F2, F3]
-#    [5.2.2.1, 5.5.1]
+# 4.  NODES: cluster within a subject, then match across subjects   [5.2.2.1, 5.5.1]   [F2, F3]
 # =====================================================================================
 # 5.2.2.1  cluster arc endpoints within a subject into node junctions
 def build_nodes(arcs, params: FusionParams):
@@ -1398,9 +1053,9 @@ def _slot_pos(slot, subj_nodes, weights):
     return (w[:, None] * P).sum(axis=0)
 
 # =====================================================================================
-# 5b.  PHANTOM REGIONS -- partial-coverage topology alignment      [Situation 2 vs 3]   [5.3]
+# 5.  PHANTOM REGIONS -- partial-coverage topology alignment   [5.3]   [Situation 2 vs 3]
 # =====================================================================================
-# Identity is the FRAGMENT CODE (section 0b): unique per connected piece, canonical
+# Identity is the FRAGMENT CODE (section 1): unique per connected piece, canonical
 # across subjects. Per fragment code absent from some subjects:
 #   point      -- island (closed loop, <=1 real neighbour): tiny copy at the seed
 #   line       -- lens (exactly 2 neighbours): collapse onto the host border
@@ -1605,20 +1260,14 @@ def _inject_line_phantom(R, s, tmpl, subj_arcs, params):
     ts = sorted(f[0] for f in feet)
     if not (1e-6 < ts[0] and ts[-1] < H.length() - 1e-6 and ts[-1] - ts[0] > 1e-6):
         return None, f"feet of fragment {R} not interior to host border {pair}"
-    f0, f1 = sorted(feet, key=lambda f: f[0])
-    seg = np.vstack([np.asarray(f0[1], float), np.asarray(f1[1], float)])
-    # 5.3.3.2  the host border is CUT, not merely split: between the two feet the neighbours
-    # are separated by R, so that stretch is no longer a wall between them. It is dropped, the
-    # same absorption the tree reduction performs on its diagonals at 5.3.3.3.7.
-    _k = lambda q: (round(float(q[0]), 9), round(float(q[1]), 9))
-    _feet = {_k(f0[1]), _k(f1[1])}
-    pieces = [p for p in _split_polyline_at(H.pts, feet)
-              if {_k(p[0]), _k(p[-1])} != _feet]
+    pieces = _split_polyline_at(H.pts, feet)
     # identity, never list.remove: Arc.__eq__ compares numpy arrays and raises on two arcs
     # that happen to share a code
     subj_arcs[s][:] = [a for a in subj_arcs[s] if a is not H]
     for p in pieces:
         subj_arcs[s].append(Arc(tuple(int(c) for c in H.code), p, closed=False))
+    f0, f1 = sorted(feet, key=lambda f: f[0])
+    seg = np.vstack([np.asarray(f0[1], float), np.asarray(f1[1], float)])
     for a in tmpl["arcs"]:
         if not a.closed:
             subj_arcs[s].append(Arc(tuple(int(c) for c in a.code), seg.copy(),
@@ -1909,7 +1558,156 @@ def _ctx_prefix(ctx):
     return ("[" + " | ".join(parts) + "] ") if parts else ""
 
 # =====================================================================================
-# 6.  Closed-loop (island) alignment                                            [C5]   [5.6.2.1]
+# 6.  CURVATURE, ARC LENGTH, CURVATURE-ADAPTIVE SAMPLING   [5.6.6.1, 5.6.6.2]   [F1a]
+# =====================================================================================
+def arclength(P, closed=False):
+    """Cumulative arc length along P, one value per vertex. [5.6.3]"""
+    Q = np.vstack([P, P[0]]) if closed else np.asarray(P, float)
+    return np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(Q, axis=0).T))])
+
+def _dedup(P, eps=1e-12):
+    P = np.asarray(P, float)
+    if len(P) < 2:
+        return P
+    keep = np.r_[True, (np.abs(np.diff(P, axis=0)) > eps).any(axis=1)]
+    return P[keep]
+
+def densify(P, spacing, closed=False):
+    """Throwaway dense working copy at uniform arc-length spacing. [5.6.3]"""
+    P = _dedup(P)
+    if len(P) < 2:
+        return P
+    Q = np.vstack([P, P[0]]) if closed else P
+    s = arclength(Q)
+    if s[-1] <= 0:
+        return P
+    n = max(2, int(math.ceil(s[-1] / max(spacing, 1e-9))) + 1)
+    t = np.linspace(0.0, s[-1], n)
+    return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
+
+# 5.6.3  curvature per point along an arc polyline
+def curvature(P, sigma_px=1.0, spacing=None, closed=False):
+    """Discrete SIGNED curvature AT A SCALE; P must be arc-length parameterised. [5.6.3]
+    x(s) and y(s) are Gaussian-smoothed at sigma_px before differentiating, without which a
+    finely flattened polyline over-reports |kappa| by ~27x."""
+    P = np.asarray(P, float)
+    if len(P) < 5:
+        return np.zeros(len(P))
+    if spacing is None:
+        s = arclength(P, closed)
+        spacing = max(s[-1] / max(len(P) - 1, 1), 1e-9)
+    sig = max(sigma_px / max(spacing, 1e-9), 0.6)
+    mode = "wrap" if closed else "nearest"
+    X = gaussian_filter1d(P[:, 0], sig, mode=mode)
+    Y = gaussian_filter1d(P[:, 1], sig, mode=mode)
+    Q = np.column_stack([X, Y])
+    d1 = np.gradient(Q, axis=0)
+    d2 = np.gradient(d1, axis=0)
+    num = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    den = (d1[:, 0] ** 2 + d1[:, 1] ** 2) ** 1.5 + 1e-12
+    return num / den
+
+# 5.6.6.1.1  sagitta (max chord deviation) between a polyline and its resampling
+def max_deviation(P, R):
+    """Max distance from the vertices of P to the polyline R. [5.6.6.1.1]"""
+    P = np.asarray(P, float); R = np.asarray(R, float)
+    if len(R) < 2 or len(P) == 0:
+        return 0.0
+    A, B = R[:-1], R[1:]
+    AB = B - A
+    L2 = (AB ** 2).sum(1) + 1e-12
+    AP = P[:, None, :] - A[None]
+    t = np.clip((AP * AB[None]).sum(2) / L2[None], 0.0, 1.0)
+    proj = A[None] + t[..., None] * AB[None]
+    d = np.linalg.norm(P[:, None, :] - proj, axis=2)
+    return float(d.min(axis=1).max())
+
+# 5.6.6.1  grow the sample count until the sagitta bound is met (5.6.6.1.3 returns the max across subjects)
+def segment_budget(sub_arcs, tol_px, n_min, n_max, sigma_px, spacing, lam=0.5):
+    """F1a sagitta bound: chords needed to stay within tol_px of the true arc. [5.6.6.1.1]
+    m = ceil(L / sqrt(8 * tol * r)), clamped to [n_min_seg, n_max_seg]; hitting the clamp is
+    reported as S7_budget_saturated."""
+    n = n_min
+    for P in sub_arcs:
+        P = _dedup(P)
+        if len(P) < 2:
+            continue
+        L = float(arclength(P)[-1])
+        if L <= 0:
+            continue
+        k = np.abs(curvature(P, sigma_px, spacing))
+        kmax = float(k.max()) if len(k) else 0.0
+        m = 2 if kmax < 1e-9 else int(math.ceil(L / math.sqrt(8.0 * tol_px * (1.0 / kmax))))
+        m = int(np.clip(m, n_min, n_max))
+        while m < n_max:                                # verify, then grow
+            R = resample_by_curvature(P, m, lam, sigma_px, spacing, abs_k=k)  # reuse k (same P)
+            if max_deviation(P, R) <= tol_px:
+                break
+            m = min(n_max, int(m * 1.6) + 1)
+        n = max(n, m)
+    return int(np.clip(n, n_min, n_max))
+
+# 5.6.6.2  place points by arc length (lam=0), curvature (lam=1) or a blend
+def resample_by_curvature(P, n, lam=0.5, sigma_px=1.0, spacing=None, closed=False, abs_k=None):
+    """F1a reparameterisation, sampling s' uniformly. [5.6.6.2]
+    s' = (1-lam)*arclength + lam*cumulative|curvature|."""
+    P = _dedup(P)
+    if len(P) == 0:
+        return np.zeros((n, 2))
+    if len(P) < 2:
+        return np.repeat(P[:1], n, axis=0)
+    Q = np.vstack([P, P[0]]) if closed else P
+    s = arclength(Q)
+    if s[-1] <= 0:
+        return np.repeat(Q[:1], n, axis=0)
+    # abs_k: |curvature| for THESE points, if the caller already computed it (segment_budget does).
+    # Valid only when it matches Q's length; otherwise recompute. Saves a gaussian_filter1d + two
+    # np.gradient passes per resample, which the verify-and-grow loop calls repeatedly.
+    if abs_k is not None and len(abs_k) == len(Q):
+        k = abs_k
+    else:
+        k = np.abs(curvature(Q, sigma_px, spacing, closed))
+    ck = np.concatenate([[0.0], np.cumsum(k[:-1] * np.diff(s))])
+    if lam <= 0 or ck[-1] < 1e-9:                       # <- the guard
+        u = s / s[-1]
+    else:
+        u = (1 - lam) * s / s[-1] + lam * ck / ck[-1]
+    u = np.maximum.accumulate(u)
+    u = u + np.linspace(0.0, 1e-9, len(u))              # strict monotonicity for np.interp
+    u = (u - u[0]) / max(u[-1] - u[0], 1e-12)
+    t = np.linspace(0.0, 1.0, n)
+    return np.column_stack([np.interp(t, u, Q[:, 0]), np.interp(t, u, Q[:, 1])])
+
+def resample_open(pts, n):
+    """Resample an open polyline to n points, evenly by arc length. [5.6.6.2]"""
+    P = _dedup(pts)
+    if len(P) < 2:
+        return np.repeat(np.asarray(pts, float)[:1], n, axis=0)
+    s = arclength(P)
+    if s[-1] <= 0:
+        return np.repeat(P[:1], n, axis=0)
+    t = np.linspace(0.0, s[-1], n)
+    return np.column_stack([np.interp(t, s, P[:, 0]), np.interp(t, s, P[:, 1])])
+
+def resample_closed(pts, n):
+    """Resample a closed contour to n points, evenly by arc length. [5.6.6.2]"""
+    P = _dedup(pts)
+    if len(P) < 2:
+        return np.repeat(np.asarray(pts, float)[:1], n, axis=0)
+    Q = np.vstack([P, P[0]]) if np.hypot(*(P[0] - P[-1])) > 1e-12 else P
+    s = arclength(Q)
+    if s[-1] <= 0:
+        return np.repeat(Q[:1], n, axis=0)
+    t = np.linspace(0.0, s[-1], n, endpoint=False)
+    return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
+
+def signed_area(P):
+    """Shoelace area of a closed contour; the sign gives its winding. [5.6.2.1]"""
+    x, y = P[:, 0], P[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+# =====================================================================================
+# 7.  CLOSED-LOOP (ISLAND) ALIGNMENT   [5.6.2.1]   [C5]
 # =====================================================================================
 # 5.6.2.1  rotate a closed loop until its start point lines up (FFT correlation)
 def fft_align_closed(A, B):
@@ -1947,7 +1745,170 @@ def align_closed(A, B, params: FusionParams):
     return fft_align_closed(A, B)
 
 # =====================================================================================
-# 7.  Arc matching + arc fusion (SATM anchors + F1a sampling)   [5.6.1, 5.6.6]
+# 8.  ARC REPRESENTATION: polyline (F1a) or spline (F1b), behind one interface   [5.6.3]
+# =====================================================================================
+# 5.6.3.1 / 5.6.3.2  ArcRep wrapper holding the dense working copy of one arc
+class ArcRep:
+    """A curve that can be EVALUATED at any fractional position u in [0,1], and whose curvature can
+    be asked for at those positions. [5.6.3.1]"""
+
+    def __init__(self, P, params: FusionParams, closed=False):
+        self.closed = closed
+        self.params = params
+        P = _dedup(P)
+        if closed and len(P) > 2 and np.hypot(*(P[0] - P[-1])) < 1e-12:
+            P = P[:-1]
+        self.raw = P
+        self.fit_residual = 0.0
+        self.dense = densify(P, params.curv_sample_px, closed)
+        self._D = np.vstack([self.dense, self.dense[0]]) if closed else self.dense
+        s = arclength(self._D)
+        self._u = s / max(s[-1], 1e-12)
+        self._len = float(s[-1])
+        self._k = None
+
+    # -- evaluation -------------------------------------------------------------------
+    def eval(self, u):
+        u = np.atleast_1d(np.asarray(u, float))
+        return np.column_stack([np.interp(u, self._u, self._D[:, 0]),
+                                np.interp(u, self._u, self._D[:, 1])])
+
+    def curvature_at(self, u):
+        u = np.atleast_1d(np.asarray(u, float))
+        if self._k is None:
+            self._k = curvature(self._D, self.params.curv_sigma_px,
+                                self.params.curv_sample_px, self.closed)
+        return np.interp(u, self._u, self._k)
+
+    def length(self):
+        return self._len
+
+    def sub_raw(self, u0, u1, m=64):
+        """The piece between u0 and u1 as a dense polyline (used for the sagitta budget)."""
+        m = max(m, int(abs(u1 - u0) * len(self._D)) + 2)
+        return self.eval(np.linspace(u0, u1, m))
+
+    def sub(self, u0, u1, n, lam):
+        """The piece between u0 and u1, resampled to n points with F1a's curvature reparam.
+        On the spline path the segment is fit as a cubic spline with anchor endpoints, so
+        corners survive."""
+        P = self.sub_raw(u0, u1, 4 * max(n, 8))
+        if self.params.representation == "spline" and len(P) >= 5:
+            try:
+                tck, _u = splprep([P[:, 0], P[:, 1]], s=self.params.spline_smooth, k=3)
+                t = np.linspace(0.0, 1.0, max(8 * n, 64))
+                x, y = splev(t, tck)
+                E = np.column_stack([x, y])
+                self.fit_residual = max(self.fit_residual,
+                                        float(cKDTree(E).query(P)[0].max()))   # -> S7_fit_residual
+                P = E
+            except Exception as e:                                             # never crash
+                warnings.warn(f"spline fit failed on a segment ({e}); using the polyline")
+        return resample_by_curvature(P, n, lam, self.params.curv_sigma_px,
+                                     self.params.curv_sample_px)
+
+# =====================================================================================
+# 9.  KEY POINTS (SATM Step 1) and their matching (SATM Step 2)   [5.6.4]   [F1]
+# =====================================================================================
+# 5.6.4.1 / 5.6.4.1.1  local maxima of |curvature| above the floor, within a spacing
+def edge_keypoints(rep: ArcRep, params: FusionParams):
+    """Local |curvature| maxima, at least kp_alpha apart, above kp_curv_thresh. [5.6.4.1]
+    Returns fractional positions u in (0,1), sorted."""
+    if not params.keypoints:
+        return []
+    L = rep.length()
+    if L < 2 * params.kp_alpha:
+        return []                                       # too short to hold an interior anchor
+    n = max(32, int(L / max(params.curv_sample_px, 1e-6)))
+    u = np.linspace(0.0, 1.0, n)
+    a = np.abs(rep.curvature_at(u))
+
+    interior = np.arange(1, n - 1)
+    loc = interior[(a[1:-1] >= a[:-2]) & (a[1:-1] >= a[2:])]
+    cand = [int(i) for i in loc if a[i] >= params.kp_curv_thresh]
+
+    margin = params.kp_alpha / L                        # keep key points off the node anchors
+    keep = []
+    for i in sorted(cand, key=lambda j: -a[j]):         # strongest first: SATM's greedy alpha rule
+        if u[i] < margin or u[i] > 1.0 - margin:
+            continue
+        if all(abs(u[i] - u[j]) * L >= params.kp_alpha for j in keep):
+            keep.append(i)
+    return sorted(float(u[i]) for i in keep)
+
+# 5.6.4.2  benefit matrix (5.6.4.2.1) solved by the Hungarian algorithm (5.6.4.2.2)
+def match_keypoints(repA, uA, repB, uB, params: FusionParams, l_scale=None):
+    """SATM Step 2, applied per arc. [5.6.4.2]
+    Returns [(uA_k, uB_r), ...], sorted, strictly monotone in BOTH arcs."""
+    if not uA or not uB:
+        return [], 0
+    if l_scale is None:
+        l_scale = params.kp_l_scale
+    if l_scale is None:
+        l_scale = 0.5 * (repA.length() + repB.length())
+
+    PA, PB = repA.eval(np.array(uA)), repB.eval(np.array(uB))
+    g = params.kp_gamma * float(l_scale)
+    A3 = np.column_stack([PA, g * np.asarray(uA, float)])
+    B3 = np.column_stack([PB, g * np.asarray(uB, float)])
+
+    D = np.linalg.norm(A3[:, None, :] - B3[None, :, :], axis=2)
+    M, R = len(uA), len(uB)
+    Ben = np.zeros((M + R, M + R))
+    Ben[:M, :R] = np.maximum(0.0, params.kp_dmax - D)   # SATM's benefit matrix, zero-padded
+    r, c = linear_sum_assignment(-Ben)
+
+    pairs = sorted((uA[i], uB[j]) for i, j in zip(r, c)
+                   if i < M and j < R and Ben[i, j] > 0.0)
+    out, crossed = [], 0
+    for ua, ub in pairs:                                # a crossing match would invert a segment
+        if out and (ua <= out[-1][0] or ub <= out[-1][1]):
+            crossed += 1
+            continue
+        out.append((ua, ub))
+    return out, crossed
+
+# 5.6.4.3 / 5.6.5  anchors with 2+ matches are kept; a missing subject is interpolated (5.6.4.3.2)
+def anchor_table(reps, ref, params: FusionParams):
+    """N-subject generalisation of SATM's pairwise key-point matching. [5.6.4.3]
+    Returns ({sid: [0.0, ..., 1.0]}, n_anchors, n_dropped), same length for every subject; an
+    anchor non-monotone in any subject is dropped (S7_kp_nonmonotone)."""
+    sids = list(reps)
+    uref = edge_keypoints(reps[ref], params)
+    if not uref or len(sids) == 1:
+        return {s: [0.0, 1.0] for s in sids}, 0, 0
+
+    matched = {ref: {u: u for u in uref}}
+    dropped = 0
+    for s in sids:
+        if s == ref:
+            continue
+        us = edge_keypoints(reps[s], params)
+        pairs, crossed = match_keypoints(reps[ref], uref, reps[s], us, params)
+        dropped += crossed
+        matched[s] = dict(pairs)
+
+    keep = [u for u in uref if sum(1 for s in sids if u in matched[s]) >= 2]
+    if not keep:
+        return {s: [0.0, 1.0] for s in sids}, 0, dropped
+
+    table = {}
+    for s in sids:
+        m = matched[s]
+        ku = [0.0] + [u for u in keep if u in m] + [1.0]
+        kv = [0.0] + [m[u] for u in keep if u in m] + [1.0]
+        table[s] = [0.0] + [float(np.interp(u, ku, kv)) for u in keep] + [1.0]
+
+    ok = [i for i in range(1, len(keep) + 1)
+          if all(table[s][i] > table[s][i - 1] + 1e-6 and table[s][i] < table[s][i + 1] - 1e-6
+                 for s in sids)]
+    dropped += len(keep) - len(ok)
+    for s in sids:
+        table[s] = [0.0] + [table[s][i] for i in ok] + [1.0]
+    return table, len(ok), dropped
+
+# =====================================================================================
+# 10.  ARC MATCHING + ARC FUSION (SATM anchors + F1a sampling)   [5.6.1, 5.6.6]
 # =====================================================================================
 def _arc_key(arc, nmap):
     if arc.closed or arc.n0 is None or arc.n1 is None:
@@ -2103,7 +2064,7 @@ def fuse_arc_group(key, group, fused_xy, node_map, weights, params: FusionParams
     return out, st
 
 # =====================================================================================
-# 8.  The fusion driver                                                        [F4, F7]   [5.5-5.6]
+# 11.  THE FUSION DRIVER   [5.5-5.6]   [F4, F7]
 # =====================================================================================
 @dataclass
 class FusionResult:
@@ -2311,7 +2272,7 @@ def fuse_graphs(graphs, weights=None, params: FusionParams = None, seeds=None, r
     return res
 
 # =====================================================================================
-# 9.  REBUILD -- THE POLYGONS ARE THE ATLAS                                 [F5 / C3]   [5.7]
+# 12.  REBUILD -- THE POLYGONS ARE THE ATLAS   [5.7]   [F5 / C3]
 # =====================================================================================
 # The fused ARCS are the line network; the FACES are the deliverable, because the next step is
 # a volumetric model and a filled polygon rasterises directly.
@@ -2661,7 +2622,82 @@ def anchors_from_regions(regions, min_area=1.0):
     return [(r["rid"], r["x"], r["y"], r["clearance"], n[r["rid"]]) for r in a]
 
 # =====================================================================================
-# 10.  Diagnostics: S1..S6 (pipeline correctness) + S7 (SHAPE QUALITY)   [5.8.1]
+# 13.  REGION REGISTRY  (persistent, PER SLICE)   [5.7.4]
+# =====================================================================================
+# The report's registry assumes one image pair = one map. Here a region legitimately does not
+# appear on most slices, so a global registry would mark ~99% of DB09 inactive every run.
+# Keyed by slice: "absent" is measured against what the TEMPLATE says should be on THIS slice.
+def load_registry(path):
+    """Read the per-slice region registry, returning a fresh one if absent. [5.7.4]"""
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            warnings.warn(f"registry unreadable ({e}); starting a fresh one")
+    return {"next_new_id": None, "next_unlabeled_id": None, "slices": {}}
+
+def save_registry(reg, path):
+    """Write the per-slice region registry as JSON. [5.7.4]"""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(reg, f, indent=2, sort_keys=True)
+    return path
+
+def registry_next_new(reg, params):
+    """Next expert-drawn region id to allocate. [5.7.4]"""
+    return int(reg.get("next_new_id") or params.new_id_start)
+
+def registry_next_unlabeled(reg, params):
+    """Next UNLABELED region id to allocate. [5.7.4]"""
+    return int(reg.get("next_unlabeled_id") or params.unlabeled_id_start)
+
+def registry_update(reg, slice_index, present, expected, run_id,
+                    next_new=None, next_unlabeled=None, params=None):
+    """present = region ids in the FUSED map for this slice expected = region ids the template says
+    should be on this slice Expected-but-absent is FLAGGED inactive, never deleted. [5.7.4]"""
+    params = params or FusionParams()
+    key = str(int(slice_index))
+    rec = reg["slices"].setdefault(key, {"regions": {}})
+    known = set(int(k) for k in rec["regions"]) | set(int(x) for x in expected)
+    for rid in sorted(set(int(x) for x in present)):
+        r = rec["regions"].setdefault(str(rid), {"first_seen_run": run_id})
+        r["status"] = "active"
+        r["last_seen_run"] = run_id
+        r["source"] = ("unlabeled" if rid >= params.unlabeled_id_start and rid < params.new_id_start
+                       else "expert" if rid >= params.new_id_start else "template")
+        r.pop("deleted_run", None)
+    for rid in sorted(known - set(int(x) for x in present)):
+        r = rec["regions"].setdefault(str(rid), {"first_seen_run": run_id})
+        if r.get("status") != "inactive":
+            r["status"] = "inactive"
+            r["deleted_run"] = run_id
+    if next_new is not None:
+        reg["next_new_id"] = int(next_new)
+    if next_unlabeled is not None:
+        reg["next_unlabeled_id"] = int(next_unlabeled)
+    return reg
+
+def registry_purge(reg, slice_index=None):
+    """Delete inactive region records, for one slice or all. [5.7.4]"""
+    keys = [str(int(slice_index))] if slice_index is not None else list(reg["slices"])
+    n = 0
+    for k in keys:
+        regs = reg["slices"].get(k, {}).get("regions", {})
+        for r in [r for r, v in regs.items() if v.get("status") == "inactive"]:
+            regs.pop(r)
+            n += 1
+    return reg, n
+
+def registry_inactive(reg, slice_index):
+    """Region ids marked inactive on one slice. [5.7.4]"""
+    regs = reg["slices"].get(str(int(slice_index)), {}).get("regions", {})
+    return sorted(int(r) for r, v in regs.items() if v.get("status") == "inactive")
+
+# =====================================================================================
+# 14.  DIAGNOSTICS: S1..S6 (pipeline correctness) + S7 (SHAPE QUALITY)   [5.8.1]
 # =====================================================================================
 # The S1..S6 table is stage-localised, so one failing label localises the break. Its blind spot,
 # named by AFAM: it measures PIPELINE CORRECTNESS and almost nothing about whether the fused
@@ -2918,8 +2954,7 @@ def diag_euler(fused_arcs, fused_xy, faces):
             "G_euler_defect": (V - E + F) - C}
 
 # =====================================================================================
-# 11.  S7 SHAPE-QUALITY SUITE  (M1 roundness, M2 PERI, M3' AVG_GL, M4 SKELE,   [5.8.2]
-#                               M6 TOPO delta, M7 curvature KS)
+# 15.  S7 SHAPE-QUALITY SUITE  (M1 roundness, M2 PERI, M3' AVG_GL, M4 SKELE, M7 CURV)   [5.8.2]
 # =====================================================================================
 def _boundary_pts(poly, spacing=0.5):
     out = []
@@ -3079,7 +3114,7 @@ def diag_shape(regions, subj_regions, weights, astats, params: FusionParams):
     return out
 
 # =====================================================================================
-# 12.  Reporting   [5.8]
+# 16.  REPORTING   [5.8]
 # =====================================================================================
 def print_report(d, title="fusion diagnostics", verbose=False):
     """Print the diagnostics dict grouped by stage. [5.8]"""
@@ -3111,82 +3146,84 @@ def print_report(d, title="fusion diagnostics", verbose=False):
     return bad
 
 # =====================================================================================
-# 13.  Region registry  (persistent, PER SLICE)   [5.7.4]
+# 17.  S7_sweep_identity + the weight-sweep stability curve   [5.8.3, 5.8.4]   [M8]
 # =====================================================================================
-# The report's registry assumes one image pair = one map. Here a region legitimately does not
-# appear on most slices, so a global registry would mark ~99% of DB09 inactive every run.
-# Keyed by slice: "absent" is measured against what the TEMPLATE says should be on THIS slice.
-def load_registry(path):
-    """Read the per-slice region registry, returning a fresh one if absent. [5.7.4]"""
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:
-            warnings.warn(f"registry unreadable ({e}); starting a fresh one")
-    return {"next_new_id": None, "next_unlabeled_id": None, "slices": {}}
+def _sample_arcs(arcs, step=0.25):
+    P = []
+    for a in arcs:
+        Q = np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts
+        P.append(densify(Q, step))
+    return np.vstack(P) if P else np.zeros((0, 2))
 
-def save_registry(reg, path):
-    """Write the per-slice region registry as JSON. [5.7.4]"""
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(reg, f, indent=2, sort_keys=True)
-    return path
+def _curve_dist(arcsA, arcsB, step=0.25):
+    """Symmetric max POINT-TO-POLYLINE distance (not point-cloud, which has a step/2 floor)."""
+    PA, PB = _sample_arcs(arcsA, step), _sample_arcs(arcsB, step)
+    if not len(PA) or not len(PB):
+        return float("nan")
+    LA = [np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts for a in arcsA]
+    LB = [np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts for a in arcsB]
+    dA = np.min([[max_deviation(p[None], R) for R in LB] for p in PA], axis=1).max()
+    dB = np.min([[max_deviation(p[None], R) for R in LA] for p in PB], axis=1).max()
+    return float(max(dA, dB))
 
-def registry_next_new(reg, params):
-    """Next expert-drawn region id to allocate. [5.7.4]"""
-    return int(reg.get("next_new_id") or params.new_id_start)
-
-def registry_next_unlabeled(reg, params):
-    """Next UNLABELED region id to allocate. [5.7.4]"""
-    return int(reg.get("next_unlabeled_id") or params.unlabeled_id_start)
-
-def registry_update(reg, slice_index, present, expected, run_id,
-                    next_new=None, next_unlabeled=None, params=None):
-    """present = region ids in the FUSED map for this slice expected = region ids the template says
-    should be on this slice Expected-but-absent is FLAGGED inactive, never deleted. [5.7.4]"""
+def sweep_identity(graphs, params: FusionParams = None, step=0.5):
+    """S7_sweep_identity: all weight on subject i must return subject i's own map. [5.8.3]
+    Bound is fit_tol*3 + node_tol/2; needs no reference data."""
     params = params or FusionParams()
-    key = str(int(slice_index))
-    rec = reg["slices"].setdefault(key, {"regions": {}})
-    known = set(int(k) for k in rec["regions"]) | set(int(x) for x in expected)
-    for rid in sorted(set(int(x) for x in present)):
-        r = rec["regions"].setdefault(str(rid), {"first_seen_run": run_id})
-        r["status"] = "active"
-        r["last_seen_run"] = run_id
-        r["source"] = ("unlabeled" if rid >= params.unlabeled_id_start and rid < params.new_id_start
-                       else "expert" if rid >= params.new_id_start else "template")
-        r.pop("deleted_run", None)
-    for rid in sorted(known - set(int(x) for x in present)):
-        r = rec["regions"].setdefault(str(rid), {"first_seen_run": run_id})
-        if r.get("status") != "inactive":
-            r["status"] = "inactive"
-            r["deleted_run"] = run_id
-    if next_new is not None:
-        reg["next_new_id"] = int(next_new)
-    if next_unlabeled is not None:
-        reg["next_unlabeled_id"] = int(next_unlabeled)
-    return reg
+    sids = list(graphs)
+    bound = params.fit_tol_px * 3 + params.node_tol / 2
+    out = {}
+    for i in sids:
+        w = {s: (1.0 if s == i else 0.0) for s in sids}
+        w[i] = 1.0
+        p2 = FusionParams(**{**params.__dict__})
+        p2.strict_topo = False                      # a one-hot run must not abort on topology
+        p2.phantom_regions = False                  # nor inject phantoms (would perturb identity)
+        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
+        res = fuse_graphs(graphs, weights={s: (1.0 if s == i else 1e-12) for s in sids},
+                          params=p2)
+        out[i] = _curve_dist(res.arcs, graph_to_arcs(graphs[i]), step)
+    worst = max(out.values()) if out else 0.0
+    return {"S7_sweep_identity_px": round(worst, 4),
+            "S7_sweep_identity_bound_px": round(bound, 4),
+            "S7_sweep_identity_per_subject": {k: round(v, 4) for k, v in out.items()},
+            "S7_sweep_identity_ok": bool(worst <= bound)}
 
-def registry_purge(reg, slice_index=None):
-    """Delete inactive region records, for one slice or all. [5.7.4]"""
-    keys = [str(int(slice_index))] if slice_index is not None else list(reg["slices"])
-    n = 0
-    for k in keys:
-        regs = reg["slices"].get(k, {}).get("regions", {})
-        for r in [r for r, v in regs.items() if v.get("status") == "inactive"]:
-            regs.pop(r)
-            n += 1
-    return reg, n
+THRESHOLDS["S7_sweep_identity_ok"] = ("==", True)
 
-def registry_inactive(reg, slice_index):
-    """Region ids marked inactive on one slice. [5.7.4]"""
-    regs = reg["slices"].get(str(int(slice_index)), {}).get("regions", {})
-    return sorted(int(r) for r, v in regs.items() if v.get("status") == "inactive")
+def sweep_weights(graphs, seeds, expected_ids, pair=None, steps=11,
+                  params: FusionParams = None, metrics=("S7_peri_dev_mean_signed",
+                                                        "S7_round_dev_max",
+                                                        "S7_avg_gl_dev_mean",
+                                                        "S6_iou_area_weighted",
+                                                        "S7_topo_delta")):
+    """M8 weight-sweep stability curve: sweep w from 0 to 1 between two subjects. [5.8.4]
+    Returns one dict per w; non-monotone metrics in between indicate instability."""
+    params = params or FusionParams()
+    sids = list(graphs)
+    a, b = pair or (sids[0], sids[-1])
+    rows = []
+    for w in np.linspace(0.0, 1.0, steps):
+        wts = {s: 1e-12 for s in sids}
+        wts[a] = max(1.0 - w, 1e-12)
+        wts[b] = max(w, 1e-12)
+        p2 = FusionParams(**{**params.__dict__})
+        p2.strict_topo = False
+        p2.phantom_regions = False                  # weight sweep must recover inputs at w=0/1
+        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
+        try:
+            out = run_fusion({a: graphs[a], b: graphs[b]}, seeds, expected_ids, weights=wts,
+                             params=p2, slice_index=0, verbose=False)
+            row = {"w": round(float(w), 3)}
+            row.update({m: out["diag"].get(m) for m in metrics})
+            row["n_regions"] = len(out["regions"])
+        except Exception as e:
+            row = {"w": round(float(w), 3), "error": f"{type(e).__name__}: {e}"}
+        rows.append(row)
+    return rows
 
 # =====================================================================================
-# 14.  One-call driver   [5]
+# 18.  ONE-CALL DRIVER   [5]   -- composes sections 1-17, so it follows all of them
 # =====================================================================================
 def _subject_regions(res, seeds, params):
     """Each subject's OWN polygons -- the reference the S6/S7 metrics are measured against."""
@@ -3297,79 +3334,25 @@ def run_fusion(graphs, seeds, expected_ids, weights=None, params: FusionParams =
             "registry": registry, "diag": d}
 
 # =====================================================================================
-# 15.  S7_sweep_identity + the weight-sweep stability curve            [M8, AFAM prio 2]
-#    [5.8.3, 5.8.4]
+# 19.  MIDLINE ARCS: delete rather than reflect   [6.1.1]
 # =====================================================================================
-def _sample_arcs(arcs, step=0.25):
-    P = []
+def drop_midline_arcs(arcs, midline_lr, tol, outer_code=0):
+    """Remove arcs that lie ENTIRELY on the L-R midline, before the graph is rebuilt. [6.1.1]
+    Reflecting such an arc puts a wall down the centre of the brain, and polygonize then emits
+    two half-faces instead of one face spanning both hemispheres. Only an arc whose every point
+    is within `tol` of the midline AND whose non-background code is a real region is dropped,
+    so a genuine near-midline boundary between two DIFFERENT regions survives.
+    Returns (kept arcs, [(code, n_points), ...] dropped)."""
+    keep, dropped = [], []
+    out = int(outer_code)
     for a in arcs:
-        Q = np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts
-        P.append(densify(Q, step))
-    return np.vstack(P) if P else np.zeros((0, 2))
-
-def _curve_dist(arcsA, arcsB, step=0.25):
-    """Symmetric max POINT-TO-POLYLINE distance (not point-cloud, which has a step/2 floor)."""
-    PA, PB = _sample_arcs(arcsA, step), _sample_arcs(arcsB, step)
-    if not len(PA) or not len(PB):
-        return float("nan")
-    LA = [np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts for a in arcsA]
-    LB = [np.vstack([a.pts, a.pts[0]]) if a.closed else a.pts for a in arcsB]
-    dA = np.min([[max_deviation(p[None], R) for R in LB] for p in PA], axis=1).max()
-    dB = np.min([[max_deviation(p[None], R) for R in LA] for p in PB], axis=1).max()
-    return float(max(dA, dB))
-
-def sweep_identity(graphs, params: FusionParams = None, step=0.5):
-    """S7_sweep_identity: all weight on subject i must return subject i's own map. [5.8.3]
-    Bound is fit_tol*3 + node_tol/2; needs no reference data."""
-    params = params or FusionParams()
-    sids = list(graphs)
-    bound = params.fit_tol_px * 3 + params.node_tol / 2
-    out = {}
-    for i in sids:
-        w = {s: (1.0 if s == i else 0.0) for s in sids}
-        w[i] = 1.0
-        p2 = FusionParams(**{**params.__dict__})
-        p2.strict_topo = False                      # a one-hot run must not abort on topology
-        p2.phantom_regions = False                  # nor inject phantoms (would perturb identity)
-        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
-        res = fuse_graphs(graphs, weights={s: (1.0 if s == i else 1e-12) for s in sids},
-                          params=p2)
-        out[i] = _curve_dist(res.arcs, graph_to_arcs(graphs[i]), step)
-    worst = max(out.values()) if out else 0.0
-    return {"S7_sweep_identity_px": round(worst, 4),
-            "S7_sweep_identity_bound_px": round(bound, 4),
-            "S7_sweep_identity_per_subject": {k: round(v, 4) for k, v in out.items()},
-            "S7_sweep_identity_ok": bool(worst <= bound)}
-
-THRESHOLDS["S7_sweep_identity_ok"] = ("==", True)
-
-def sweep_weights(graphs, seeds, expected_ids, pair=None, steps=11,
-                  params: FusionParams = None, metrics=("S7_peri_dev_mean_signed",
-                                                        "S7_round_dev_max",
-                                                        "S7_avg_gl_dev_mean",
-                                                        "S6_iou_area_weighted",
-                                                        "S7_topo_delta")):
-    """M8 weight-sweep stability curve: sweep w from 0 to 1 between two subjects. [5.8.4]
-    Returns one dict per w; non-monotone metrics in between indicate instability."""
-    params = params or FusionParams()
-    sids = list(graphs)
-    a, b = pair or (sids[0], sids[-1])
-    rows = []
-    for w in np.linspace(0.0, 1.0, steps):
-        wts = {s: 1e-12 for s in sids}
-        wts[a] = max(1.0 - w, 1e-12)
-        wts[b] = max(w, 1e-12)
-        p2 = FusionParams(**{**params.__dict__})
-        p2.strict_topo = False
-        p2.phantom_regions = False                  # weight sweep must recover inputs at w=0/1
-        p2.halt_on_failure = False                  # 5.9  nor stop for reviewer round-trip
-        try:
-            out = run_fusion({a: graphs[a], b: graphs[b]}, seeds, expected_ids, weights=wts,
-                             params=p2, slice_index=0, verbose=False)
-            row = {"w": round(float(w), 3)}
-            row.update({m: out["diag"].get(m) for m in metrics})
-            row["n_regions"] = len(out["regions"])
-        except Exception as e:
-            row = {"w": round(float(w), 3), "error": f"{type(e).__name__}: {e}"}
-        rows.append(row)
-    return rows
+        P = np.asarray(a.pts, float)
+        on_midline = bool(np.all(np.abs(P[:, 1] - float(midline_lr)) <= float(tol)))
+        codes = [int(c) for c in a.code]
+        real = [c for c in codes if c != out]
+        # one real region against background, lying flat on the midline = the cut face
+        if on_midline and len(real) == 1 and out in codes:
+            dropped.append((tuple(codes), int(len(P))))
+            continue
+        keep.append(a)
+    return keep, dropped
